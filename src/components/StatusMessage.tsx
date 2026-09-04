@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { CheckCircle2, FolderOpen, RotateCcw, XCircle } from "lucide-react";
 import { openDownloadsFolder } from "../features/downloads/downloadService";
 import type { DownloadResult } from "../features/downloads/types";
@@ -9,7 +10,8 @@ interface StatusMessageProps {
   message?: string | null;
   details?: string | null;
   result?: DownloadResult | null;
-  onReset: () => void;
+  /** Null hides the reset action (e.g. unrecoverable init failure). */
+  onReset?: (() => void) | null;
 }
 
 export function StatusMessage({
@@ -20,11 +22,14 @@ export function StatusMessage({
   result,
   onReset,
 }: StatusMessageProps) {
+  const [openError, setOpenError] = useState<string | null>(null);
+
   const handleOpen = async () => {
+    setOpenError(null);
     try {
       await openDownloadsFolder();
     } catch {
-      // The backend surfaces a proper error; nothing extra to do here.
+      setOpenError("Could not open the Downloads folder.");
     }
   };
 
@@ -68,17 +73,25 @@ export function StatusMessage({
             Open Downloads
           </button>
         )}
-        <button
-          type="button"
-          className={
-            kind === "success" ? "btn btn--ghost" : "btn btn--secondary"
-          }
-          onClick={onReset}
-        >
-          <RotateCcw size={15} />
-          {kind === "success" ? "Download another" : "Try again"}
-        </button>
+        {onReset && (
+          <button
+            type="button"
+            className={
+              kind === "success" ? "btn btn--ghost" : "btn btn--secondary"
+            }
+            onClick={onReset}
+          >
+            <RotateCcw size={15} />
+            {kind === "success" ? "Download another" : "Try again"}
+          </button>
+        )}
       </div>
+
+      {openError && (
+        <div className="status__message status__message--error" role="alert">
+          {openError}
+        </div>
+      )}
     </div>
   );
 }

@@ -56,6 +56,10 @@ yt-dlp.exe  (direct execution, one argv element per argument)
   the UI never blocks.
 - Progress flows backend → frontend as Tauri events:
   `download-progress`, `download-complete`, `download-error`.
+- The UI stays in `initializing` until all event listeners are
+  registered — a download can never start with nowhere to report to.
+- A restrictive Content Security Policy is configured (no remote
+  scripts; Tauri appends its compile-time hashes/nonces automatically).
 - Argument construction lives in `build_download_args()` and binary
   discovery in `resolve_ytdlp_path()` — one place each, ready to grow
   (`DownloadOptions` already carries future `quality` / `format` /
@@ -97,14 +101,23 @@ yt-dlp-gui/
 ## Development prerequisites
 
 - **Node.js 18+** and npm
-- **Rust** via [rustup](https://rustup.rs/) (stable)
+- **Rust 1.88+** via [rustup](https://rustup.rs/) (stable; this is the
+  verified minimum: the dependency tree requires it, and the code uses
+  lint syntax that needs 1.81+)
 - **Visual Studio 2022 Build Tools** with the C++ workload
-  (provides MSVC `link.exe` — required to link the Tauri binary on
-  Windows)
+  (provides MSVC `link.exe` — required to link the Tauri binary and to
+  run `cargo test` on Windows)
 - **WebView2 Runtime** (preinstalled on Windows 10/11)
-- **Deno** (optional, not bundled): yt-dlp uses the system Deno install
-  for sites that need a JavaScript runtime. Without it you get a warning
-  and some formats may be missing.
+- **FFmpeg** (optional, not bundled): yt-dlp's default format selection
+  may download separate video and audio streams and merge them. Merging
+  needs an `ffmpeg` reachable via `PATH` (any standard install works,
+  e.g. `C:\ytdlp`). Without it, such downloads fail with an
+  understandable error instead of silently producing a wrong file. A
+  proper dependency screen is on the roadmap.
+- **Deno** (optional, not bundled): yt-dlp discovers a system Deno
+  install via `PATH` and uses it as its JavaScript runtime for sites
+  that need one. Without it yt-dlp prints a warning and some formats
+  may be missing. The app never bundles or manages Deno itself.
 
 ## Installation steps
 
@@ -142,11 +155,12 @@ included via the `bundle.resources` entry in `tauri.conf.json`.
 
 ```powershell
 npm run build          # tsc --noEmit + vite production build
+npm test               # vitest: event-readiness state machine tests
 cd src-tauri
 cargo fmt --check
 cargo clippy -- -D warnings
 cargo check
-cargo test
+cargo test             # needs MSVC link.exe on Windows
 ```
 
 ## Current limitations
@@ -154,7 +168,9 @@ cargo test
 - One download at a time (MVP guard; the state type is shaped to become
   a queue later).
 - Always downloads to the Windows Downloads folder, always a single
-  video (`--no-playlist`), default best-quality progressive format.
+  video (`--no-playlist`), yt-dlp's default format selection (separate
+  streams are merged when FFmpeg is available; the reported filename is
+  always the real post-merge file).
 - No quality picker, audio-only/MP3 mode, subtitle, playlist, history,
   cancellation, settings, or updater UI yet.
 - Full linking and `cargo test` of the Tauri crate require MSVC; with

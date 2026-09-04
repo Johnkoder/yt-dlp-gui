@@ -8,6 +8,7 @@ import "./App.css";
 export default function App() {
   const {
     status,
+    subscription,
     url,
     setUrl,
     progress,
@@ -19,7 +20,9 @@ export default function App() {
     handleReset,
   } = useDownload();
 
+  const isInitializing = status === "initializing";
   const isDownloading = status === "downloading";
+  const backendUnreachable = subscription === "failed";
 
   return (
     <div className="app">
@@ -43,12 +46,13 @@ export default function App() {
           value={url}
           onChange={setUrl}
           onSubmit={handleDownload}
-          disabled={isDownloading}
+          disabled={isDownloading || isInitializing}
         />
 
         <DownloadButton
           disabled={!canDownload}
-          loading={isDownloading}
+          loading={isDownloading || isInitializing}
+          label={isInitializing ? "Loading…" : undefined}
           onClick={handleDownload}
         />
 
@@ -66,10 +70,10 @@ export default function App() {
         {status === "error" && (
           <StatusMessage
             kind="error"
-            title="Download failed"
+            title={backendUnreachable ? "Application error" : "Download failed"}
             message={errorMessage}
             details={errorDetails}
-            onReset={handleReset}
+            onReset={backendUnreachable ? null : handleReset}
           />
         )}
       </main>

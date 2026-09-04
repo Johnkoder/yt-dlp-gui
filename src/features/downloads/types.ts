@@ -1,10 +1,19 @@
 /** Shared download-domain types for the MVP. */
 
+/**
+ * UI state machine. `initializing` lasts until all backend event listeners
+ * are registered; downloads are only allowed from `ready` (or a completed
+ * state with an active subscription).
+ */
 export type DownloadStatus =
-  | "idle"
+  | "initializing"
+  | "ready"
   | "downloading"
   | "success"
   | "error";
+
+/** Lifecycle of the backend event subscription (never a bare boolean). */
+export type EventSubscription = "pending" | "active" | "failed";
 
 /**
  * Structured progress payload emitted by the Rust backend over Tauri events.
@@ -26,7 +35,10 @@ export interface DownloadProgressEvent {
 }
 
 export interface DownloadResult {
+  /** Real final filename (after merge/post-processing). */
   filename?: string | null;
+  /** Full final path, kept for future features (reveal in folder, …). */
+  filepath?: string | null;
   downloadsDir: string;
 }
 

@@ -110,3 +110,33 @@ pub fn open_downloads_folder() -> Result<(), String> {
         return Ok(());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_http_urls() {
+        assert!(is_valid_http_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
+        assert!(is_valid_http_url("http://example.com/video.mp4"));
+        assert!(is_valid_http_url("HTTPS://EXAMPLE.COM/UPPER"));
+    }
+
+    #[test]
+    fn rejects_non_urls() {
+        assert!(!is_valid_http_url(""));
+        assert!(!is_valid_http_url("   "));
+        assert!(!is_valid_http_url("not a url"));
+        assert!(!is_valid_http_url("ftp://example.com/file.mp4"));
+        assert!(!is_valid_http_url("javascript:alert(1)"));
+        assert!(!is_valid_http_url("yt-dlp https://example.com"));
+    }
+
+    #[test]
+    fn rejects_absurd_lengths() {
+        let long = format!("https://example.com/{}", "a".repeat(3000));
+        assert!(!is_valid_http_url(&long));
+    }
+}

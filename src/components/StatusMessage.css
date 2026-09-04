@@ -74,6 +74,10 @@
   user-select: text;
 }
 
+.status__message--error {
+  color: var(--error);
+}
+
 .status__details {
   margin: 0;
   max-height: 88px;

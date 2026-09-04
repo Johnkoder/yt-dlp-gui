@@ -15,6 +15,12 @@ pub const PROGRESS_EVENT: &str = "download-progress";
 pub const COMPLETE_EVENT: &str = "download-complete";
 pub const ERROR_EVENT: &str = "download-error";
 
+/// Sentinel prefix for the `--print after_move:` line that reports the real
+/// final file after all merging/post-processing. It deliberately does not
+/// look like yt-dlp's own `[section]` log lines, so it can never be mistaken
+/// for a progress message.
+pub const FINAL_PATH_SENTINEL: &str = "YTDLP_GUI_FINAL_FILE ";
+
 const BINARY_FILE_NAME: &str = "yt-dlp.exe";
 
 /// Future-proof download options. The MVP only fills in `url` and
@@ -67,7 +73,10 @@ pub struct DownloadProgress {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadResult {
+    /// Display name of the real final file (after merge/post-processing).
     pub filename: Option<String>,
+    /// Full final path, kept for future features (reveal in folder, …).
+    pub filepath: Option<String>,
     pub downloads_dir: String,
 }
 
@@ -170,6 +179,13 @@ pub fn build_download_args(options: &DownloadOptions) -> Vec<String> {
     let mut args = vec![
         "--newline".to_string(),
         "--no-playlist".to_string(),
+        // `--print` alone suppresses yt-dlp's progress output; `--progress`
+        // re-enables it so live progress and the final-path report coexist.
+        "--progress".to_string(),
+        // Report the real final filepath after all merging/move steps, so the
+        // UI never mistakes a temporary video/audio stream file for the result.
+        "--print".to_string(),
+        format!("after_move:{FINAL_PATH_SENTINEL}%(filepath)s"),
         "-o".to_string(),
         template,
     ];
@@ -316,6 +332,34 @@ pub fn parse_progress_line(
     None
 }
 
+/// Extract the real final filepath from a `--print after_move:` sentinel
+/// line. Returns `None` for every other line, so progress output and the
+/// final path can never be confused.
+pub fn parse_final_path_line(line: &str) -> Option<PathBuf> {
+    line.strip_prefix(FINAL_PATH_SENTINEL)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn file_name_of(path: &std::path::Path) -> Option<String> {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+}
+
+/// Decide what the success UI reports: the real post-merge file when yt-dlp
+/// printed it, otherwise the last `[download] Destination:` filename, if any.
+/// The extension is never guessed or derived from stream filenames.
+fn resolve_result_filename(
+    final_path: Option<&std::path::Path>,
+    destination_filename: Option<String>,
+) -> (Option<String>, Option<String>) {
+    match final_path {
+        Some(path) => (file_name_of(path), Some(path.to_string_lossy().to_string())),
+        None => (destination_filename, None),
+    }
+}
+
 fn emit_progress(app: &AppHandle, progress: &DownloadProgress) {
     let _ = app.emit(PROGRESS_EVENT, progress);
 }
@@ -384,24 +428,58 @@ pub async fn run_download(app: AppHandle, url: String) {
         }
     };
 
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr = child.stderr.take().expect("stderr was piped");
+    // The pipes were requested above; a missing handle means the spawn is
+    // unusable, so fail loudly instead of panicking.
+    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => {
+            let _ = child.kill().await;
+            let message = "Could not capture the yt-dlp process output.".to_string();
+            emit_error(
+                &app,
+                &DownloadError {
+                    message: message.clone(),
+                    details: Some(message),
+                },
+            );
+            return;
+        }
+    };
 
-    // Read stdout line-by-line for live progress.
+    // Honest initial status: extraction produces no parseable lines yet, so
+    // say so instead of leaving the UI empty until progress arrives.
+    emit_progress(
+        &app,
+        &DownloadProgress {
+            status: "Starting download…".to_string(),
+            percentage: None,
+            speed: None,
+            eta: None,
+            filename: None,
+        },
+    );
+
+    // Read stdout line-by-line for live progress. The after_move sentinel
+    // line is captured separately and never shown as progress.
     let app_for_stdout = app.clone();
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         let mut current_filename: Option<String> = None;
-        let mut last_filename: Option<String> = None;
+        let mut destination_filename: Option<String> = None;
+        let mut final_path: Option<PathBuf> = None;
         while let Ok(Some(line)) = reader.next_line().await {
+            if let Some(path) = parse_final_path_line(line.trim_end()) {
+                final_path = Some(path);
+                continue;
+            }
             if let Some(progress) = parse_progress_line(&line, &mut current_filename) {
                 if progress.filename.is_some() {
-                    last_filename = progress.filename.clone();
+                    destination_filename = progress.filename.clone();
                 }
                 emit_progress(&app_for_stdout, &progress);
             }
         }
-        last_filename
+        (destination_filename, final_path)
     });
 
     // Collect stderr in the background (bounded tail for error display).
@@ -418,15 +496,20 @@ pub async fn run_download(app: AppHandle, url: String) {
     });
 
     let status = child.wait().await;
-    let stdout_filename = stdout_task.await.unwrap_or_default();
+    // A panicked reader task must not crash the download flow: fall back to
+    // whatever was captured (or nothing) and report the exit status honestly.
+    let (destination_filename, final_path) = stdout_task.await.unwrap_or((None, None));
     let stderr_text = stderr_task.await.unwrap_or_default();
 
     match status {
         Ok(exit) if exit.success() => {
+            let (filename, filepath) =
+                resolve_result_filename(final_path.as_deref(), destination_filename);
             emit_complete(
                 &app,
                 &DownloadResult {
-                    filename: stdout_filename,
+                    filename,
+                    filepath,
                     downloads_dir: downloads_dir.to_string_lossy().to_string(),
                 },
             );
@@ -463,31 +546,40 @@ pub async fn run_download(app: AppHandle, url: String) {
     }
 }
 
+/// Return approximately the last `max_chars` characters of `text`.
+///
+/// Operates on Unicode scalar values, never on byte offsets, so titles or
+/// errors containing emoji/CJK/accents can never cause a panic at a
+/// non-character boundary.
 fn tail_text(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
-    if trimmed.len() <= max_chars {
-        return trimmed.to_string();
+    let len = trimmed.chars().count();
+    if len <= max_chars {
+        trimmed.to_string()
+    } else {
+        trimmed.chars().skip(len - max_chars).collect()
     }
-    trimmed[trimmed.len() - max_chars..].to_string()
 }
 
+/// Pick the user-facing message from yt-dlp stderr: the last `ERROR:` line
+/// wins (earlier warnings must not hide a later real error); otherwise the
+/// first other meaningful line; `None` when there is nothing to show.
 fn first_meaningful_line(text: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    let mut last_error: Option<String> = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // Skip generic warning prefixes when a better line exists.
-        if trimmed.starts_with("WARNING:") {
+        if trimmed.is_empty() || trimmed.starts_with("WARNING:") {
             continue;
         }
         // Strip the common "ERROR: " prefix for cleaner display.
-        if let Some(rest) = trimmed.strip_prefix("ERROR: ") {
-            return Some(rest.trim().to_string());
+        if let Some(rest) = trimmed.strip_prefix("ERROR:") {
+            last_error = Some(rest.trim().to_string());
+        } else if fallback.is_none() {
+            fallback = Some(trimmed.to_string());
         }
-        return Some(trimmed.to_string());
     }
-    None
+    last_error.or(fallback)
 }
 
 #[cfg(test)]
@@ -505,6 +597,23 @@ mod tests {
         assert!((parsed.percentage.unwrap() - 37.4).abs() < 0.01);
         assert_eq!(parsed.speed.as_deref(), Some("8.40MiB/s"));
         assert_eq!(parsed.eta.as_deref(), Some("00:08"));
+        assert_eq!(parsed.status, "Downloading");
+    }
+
+    #[test]
+    fn parses_fragmented_stream_line() {
+        // Fragmented (HLS/DASH) downloads report approximate `~` sizes and
+        // often lack speed/ETA: percentage must still parse, the rest stays
+        // empty rather than failing.
+        let mut filename = None;
+        let parsed = parse_progress_line(
+            "[download]   1.3% of ~  52.84KiB at      0.00B/s ETA Unknown (frag 1/38)",
+            &mut filename,
+        )
+        .expect("should parse");
+        assert!((parsed.percentage.unwrap() - 1.3).abs() < 0.01);
+        assert_eq!(parsed.speed, None);
+        assert_eq!(parsed.eta, None);
         assert_eq!(parsed.status, "Downloading");
     }
 
@@ -529,9 +638,153 @@ mod tests {
         let args = build_download_args(&options);
         assert!(args.contains(&"--newline".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
+        // `--print` alone suppresses progress output; `--progress` keeps it.
+        assert!(args.contains(&"--progress".to_string()));
+        // The final-path report must travel as its own argv element and the
+        // URL must remain exactly one trailing argument (no shell join).
+        assert!(args.contains(&"--print".to_string()));
+        assert!(
+            args.iter()
+                .any(|a| a.starts_with("after_move:") && a.contains("%(filepath)s")),
+            "args must request the post-move filepath, got: {:?}",
+            args
+        );
+        let url_args = args
+            .iter()
+            .filter(|a| a.as_str() == "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            .count();
+        assert_eq!(url_args, 1, "URL must appear exactly once");
         assert_eq!(
             args.last().unwrap(),
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         );
+        // Output template keeps the human-friendly title-based naming.
+        let template = args
+            .iter()
+            .skip_while(|a| a.as_str() != "-o")
+            .nth(1)
+            .expect("-o must carry a template");
+        assert!(template.contains("%(title)s"));
+        assert!(template.contains("%(id)s"));
+        assert!(template.contains("%(ext)s"));
+    }
+
+    #[test]
+    fn parses_final_path_sentinel() {
+        let path = parse_final_path_line(
+            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\My Video [abc123].mp4",
+        )
+        .expect("sentinel line must parse");
+        assert_eq!(
+            path.to_string_lossy(),
+            "C:\\Users\\Alex\\Downloads\\My Video [abc123].mp4"
+        );
+        // Progress-looking lines are never mistaken for the final path.
+        assert_eq!(
+            parse_final_path_line("[download]  37.4% of 105.20MiB at 8.40MiB/s ETA 00:08"),
+            None
+        );
+        assert_eq!(
+            parse_final_path_line("[download] Destination: C:\\x\\video.webm"),
+            None
+        );
+        assert_eq!(parse_final_path_line(""), None);
+        assert_eq!(parse_final_path_line("YTDLP_GUI_FINAL_FILE   "), None);
+    }
+
+    #[test]
+    fn sentinel_is_not_progress() {
+        let mut filename = None;
+        assert!(parse_progress_line(
+            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\final.mp4",
+            &mut filename
+        )
+        .is_none());
+        assert_eq!(filename, None);
+    }
+
+    #[test]
+    fn merged_download_reports_final_file_not_streams() {
+        // Simulate: separate streams download, then the merge prints the
+        // real final path. The UI must show actual-final-video.mp4.
+        let mut current: Option<String> = None;
+        for line in [
+            "[download] Destination: video [abc123].f313.webm",
+            "[download] 100% of 10.00MiB at 5.00MiB/s ETA 00:00",
+            "[download] Destination: video [abc123].f140.m4a",
+            "[Merger] Merging formats into \"video [abc123].mp4\"",
+        ] {
+            let _ = parse_progress_line(line, &mut current);
+        }
+        assert_eq!(current.as_deref(), Some("video [abc123].f140.m4a"));
+
+        let final_path = parse_final_path_line(
+            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\video [abc123].mp4",
+        )
+        .expect("must parse");
+        let (filename, filepath) = resolve_result_filename(Some(final_path.as_path()), current);
+        assert_eq!(filename.as_deref(), Some("video [abc123].mp4"));
+        assert_eq!(
+            filepath.as_deref(),
+            Some("C:\\Users\\Alex\\Downloads\\video [abc123].mp4")
+        );
+    }
+
+    #[test]
+    fn missing_final_path_falls_back_to_destination() {
+        let (filename, filepath) = resolve_result_filename(None, Some("video.mp4".to_string()));
+        assert_eq!(filename.as_deref(), Some("video.mp4"));
+        assert_eq!(filepath, None);
+
+        let (filename, filepath) = resolve_result_filename(None, None);
+        assert_eq!(filename, None);
+        assert_eq!(filepath, None);
+    }
+
+    #[test]
+    fn truncation_is_unicode_safe() {
+        // Emoji, CJK, and accents: slicing must never panic and must keep
+        // whole characters.
+        let text = "ERROR: 下载失败 😭 日本語テスト café";
+        let tail = tail_text(text, 10);
+        assert_eq!(tail.chars().count(), 10);
+        assert!(text.ends_with(&tail));
+
+        // Multi-byte boundary stress: truncating a pure-emoji string lands
+        // inside what would be byte offsets, not char boundaries.
+        let emojis = "😀😃😄😁😆😅🤣😂🙂🙃";
+        let tail = tail_text(emojis, 4);
+        assert_eq!(tail, "🤣😂🙂🙃");
+
+        // Short text is returned whole (trimmed).
+        assert_eq!(tail_text("  café ☕  ", 100), "café ☕");
+        assert_eq!(tail_text("", 10), "");
+    }
+
+    #[test]
+    fn prefers_last_error_over_warnings() {
+        let stderr = "WARNING: [youtube] No supported JavaScript runtime could be found.\n\
+             [youtube] abc123: Downloading webpage\n\
+             ERROR: [youtube] abc123: Private video. Sign in.\n";
+        assert_eq!(
+            first_meaningful_line(stderr).as_deref(),
+            Some("[youtube] abc123: Private video. Sign in.")
+        );
+
+        // A later real error beats an earlier one.
+        let stderr = "ERROR: [generic] first problem\nERROR: [generic] final problem\n";
+        assert_eq!(
+            first_meaningful_line(stderr).as_deref(),
+            Some("[generic] final problem")
+        );
+
+        // No ERROR line: first meaningful line, warnings skipped.
+        let stderr = "WARNING: something\n[youtube] Extracting URL: https://example.com\n";
+        assert_eq!(
+            first_meaningful_line(stderr).as_deref(),
+            Some("[youtube] Extracting URL: https://example.com")
+        );
+
+        assert_eq!(first_meaningful_line("  \nWARNING: x\n  "), None);
     }
 }

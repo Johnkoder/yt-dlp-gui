@@ -4,10 +4,17 @@ import "./DownloadButton.css";
 interface DownloadButtonProps {
   disabled: boolean;
   loading: boolean;
+  label?: string;
   onClick: () => void;
 }
 
-export function DownloadButton({ disabled, loading, onClick }: DownloadButtonProps) {
+export function DownloadButton({
+  disabled,
+  loading,
+  label,
+  onClick,
+}: DownloadButtonProps) {
+  const text = label ?? (loading ? "Downloading…" : "Download Video");
   return (
     <button
       type="button"
@@ -20,7 +27,7 @@ export function DownloadButton({ disabled, loading, onClick }: DownloadButtonPro
       ) : (
         <Download size={16} strokeWidth={2.25} />
       )}
-      {loading ? "Downloading…" : "Download Video"}
+      {text}
     </button>
   );
 }

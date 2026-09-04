@@ -3,7 +3,9 @@ name = "yt-dlp-gui"
 version = "0.1.0"
 description = "Windows desktop GUI for yt-dlp"
 edition = "2021"
-rust-version = "1.77.2"
+# Floor is driven by the dependency tree (plist/time/serde_with require
+# 1.88); this also covers the `reason = "..."` lint syntax (needs 1.81+).
+rust-version = "1.88"
 
 [lib]
 name = "yt_dlp_gui_lib"

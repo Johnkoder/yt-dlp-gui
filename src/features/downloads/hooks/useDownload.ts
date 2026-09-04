@@ -9,10 +9,12 @@ import type {
   DownloadProgressEvent,
   DownloadResult,
   DownloadStatus,
+  EventSubscription,
 } from "../types";
 
 export interface UseDownloadState {
   status: DownloadStatus;
+  subscription: EventSubscription;
   url: string;
   setUrl: (url: string) => void;
   progress: DownloadProgressEvent | null;
@@ -25,19 +27,27 @@ export interface UseDownloadState {
 }
 
 /**
- * Owns the MVP download state machine: idle -> downloading -> success | error.
- * Subscribes once to backend Tauri events and updates state in real time.
+ * Owns the MVP download state machine:
+ * initializing -> ready -> downloading -> success | error.
+ *
+ * Downloads are gated on `subscription === "active"`, so the button can
+ * never fire before every backend event listener is registered. A failed
+ * subscription lands in a terminal error state that `handleReset` does not
+ * clear — the app must be restarted.
  */
 export function useDownload(): UseDownloadState {
-  const [status, setStatus] = useState<DownloadStatus>("idle");
+  const [status, setStatus] = useState<DownloadStatus>("initializing");
+  const [subscription, setSubscription] =
+    useState<EventSubscription>("pending");
   const [url, setUrlState] = useState("");
   const [progress, setProgress] = useState<DownloadProgressEvent | null>(null);
   const [result, setResult] = useState<DownloadResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
-  const [invokeError, setInvokeError] = useState<string | null>(null);
-  const statusRef = useRef<DownloadStatus>("idle");
+  const statusRef = useRef<DownloadStatus>("initializing");
   statusRef.current = status;
+  const subscriptionRef = useRef<EventSubscription>("pending");
+  subscriptionRef.current = subscription;
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -66,16 +76,29 @@ export function useDownload(): UseDownloadState {
       },
     })
       .then((fn) => {
-        if (!cancelled) {
-          unlisten = fn;
-        } else {
+        if (cancelled) {
+          // StrictMode remount or unmount beat the subscription: release it
+          // immediately so listeners are never duplicated.
           fn();
+          return;
         }
+        unlisten = fn;
+        setSubscription("active");
+        setStatus((current) =>
+          current === "initializing" ? "ready" : current,
+        );
       })
       .catch((err: unknown) => {
-        // Event subscription itself failed; surface as an error state only
-        // if the user attempts a download.
-        setInvokeError(err instanceof Error ? err.message : String(err));
+        if (cancelled) return;
+        const raw = err instanceof Error ? err.message : String(err);
+        // Terminal: the error is surfaced, never stored-then-cleared, and
+        // handleReset intentionally does not leave this state.
+        setSubscription("failed");
+        setErrorMessage(
+          "Could not connect to the application backend. Event listeners failed to start — please restart the application.",
+        );
+        setErrorDetails(raw);
+        setStatus("error");
       });
 
     return () => {
@@ -90,18 +113,28 @@ export function useDownload(): UseDownloadState {
 
   const trimmedUrl = url.trim();
   const canDownload =
-    status !== "downloading" && trimmedUrl.length > 0;
+    subscription === "active" &&
+    status !== "downloading" &&
+    status !== "initializing" &&
+    trimmedUrl.length > 0;
 
   const handleDownload = useCallback(async () => {
+    // Defense in depth: the UI disables the button, but never invoke the
+    // backend without listeners — progress/completion would be lost.
+    if (subscriptionRef.current !== "active") {
+      return;
+    }
+    if (statusRef.current === "downloading") {
+      return;
+    }
     const target = url.trim();
-    if (target.length === 0 || statusRef.current === "downloading") {
+    if (target.length === 0) {
       return;
     }
     setProgress(null);
     setResult(null);
     setErrorMessage(null);
     setErrorDetails(null);
-    setInvokeError(null);
     setStatus("downloading");
     try {
       await startDownload(target);
@@ -114,23 +147,27 @@ export function useDownload(): UseDownloadState {
   }, [url]);
 
   const handleReset = useCallback(() => {
-    if (statusRef.current === "downloading") {
+    if (
+      statusRef.current === "downloading" ||
+      subscriptionRef.current !== "active"
+    ) {
       return;
     }
     setProgress(null);
     setResult(null);
     setErrorMessage(null);
     setErrorDetails(null);
-    setStatus("idle");
+    setStatus("ready");
   }, []);
 
   return {
     status,
+    subscription,
     url,
     setUrl,
     progress,
     result,
-    errorMessage: invokeError && status === "error" && !errorMessage ? invokeError : errorMessage,
+    errorMessage,
     errorDetails,
     canDownload,
     handleDownload,
