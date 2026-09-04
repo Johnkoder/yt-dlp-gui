@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# Tauri bundles
+src-tauri/*.log
+
+# yt-dlp binary is intentionally committed as an app resource.
+# Uncomment the line below only if you prefer to fetch it at build time.
+# src-tauri/resources/bin/yt-dlp.exe
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+.env
+.env.local
