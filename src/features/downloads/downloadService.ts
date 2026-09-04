@@ -96,26 +96,50 @@ export function friendlyErrorMessage(raw: string): string {
 
 /**
  * Subscribe to backend download events. Returns an unlisten function.
+ *
+ * Registration is transactional: if any listener fails to register, the
+ * ones already acquired are released before the original error is
+ * rethrown, so a partial subscription can never leak. The returned
+ * cleanup is idempotent.
  */
 export async function subscribeToDownloadEvents(
   handlers: DownloadEventHandlers,
 ): Promise<UnlistenFn> {
-  const unlistenProgress = await listen<DownloadProgressEvent>(
-    DOWNLOAD_PROGRESS_EVENT,
-    (event) => handlers.onProgress(event.payload),
-  );
-  const unlistenComplete = await listen<DownloadResult>(
-    DOWNLOAD_COMPLETE_EVENT,
-    (event) => handlers.onComplete(event.payload),
-  );
-  const unlistenError = await listen<DownloadError>(
-    DOWNLOAD_ERROR_EVENT,
-    (event) => handlers.onError(event.payload),
-  );
+  const unlisteners: UnlistenFn[] = [];
+  try {
+    unlisteners.push(
+      await listen<DownloadProgressEvent>(
+        DOWNLOAD_PROGRESS_EVENT,
+        (event) => handlers.onProgress(event.payload),
+      ),
+    );
+    unlisteners.push(
+      await listen<DownloadResult>(
+        DOWNLOAD_COMPLETE_EVENT,
+        (event) => handlers.onComplete(event.payload),
+      ),
+    );
+    unlisteners.push(
+      await listen<DownloadError>(
+        DOWNLOAD_ERROR_EVENT,
+        (event) => handlers.onError(event.payload),
+      ),
+    );
+  } catch (error) {
+    for (const unlisten of unlisteners) {
+      unlisten();
+    }
+    throw error;
+  }
 
+  let cleanedUp = false;
   return () => {
-    unlistenProgress();
-    unlistenComplete();
-    unlistenError();
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    for (const unlisten of unlisteners) {
+      unlisten();
+    }
   };
 }

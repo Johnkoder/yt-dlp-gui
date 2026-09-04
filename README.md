@@ -100,7 +100,7 @@ yt-dlp-gui/
 
 ## Development prerequisites
 
-- **Node.js 18+** and npm
+- **Node.js 22.22.2+** and npm (required by the jsdom/vitest test tree)
 - **Rust 1.88+** via [rustup](https://rustup.rs/) (stable; this is the
   verified minimum: the dependency tree requires it, and the code uses
   lint syntax that needs 1.81+)
