@@ -4,6 +4,13 @@ import {
   startDownload,
   subscribeToDownloadEvents,
 } from "../downloadService";
+import {
+  DEFAULT_MEDIA_TYPE,
+  DEFAULT_VIDEO_QUALITY,
+  buildDownloadRequest,
+  type MediaType,
+  type VideoQuality,
+} from "../options";
 import type {
   DownloadError,
   DownloadProgressEvent,
@@ -17,6 +24,10 @@ export interface UseDownloadState {
   subscription: EventSubscription;
   url: string;
   setUrl: (url: string) => void;
+  mediaType: MediaType;
+  setMediaType: (mediaType: MediaType) => void;
+  quality: VideoQuality;
+  setQuality: (quality: VideoQuality) => void;
   progress: DownloadProgressEvent | null;
   result: DownloadResult | null;
   errorMessage: string | null;
@@ -40,6 +51,12 @@ export function useDownload(): UseDownloadState {
   const [subscription, setSubscription] =
     useState<EventSubscription>("pending");
   const [url, setUrlState] = useState("");
+  // Selection state is separate from the lifecycle state machine.
+  const [mediaType, setMediaTypeState] =
+    useState<MediaType>(DEFAULT_MEDIA_TYPE);
+  const [quality, setQualityState] = useState<VideoQuality>(
+    DEFAULT_VIDEO_QUALITY,
+  );
   const [progress, setProgress] = useState<DownloadProgressEvent | null>(null);
   const [result, setResult] = useState<DownloadResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -111,6 +128,14 @@ export function useDownload(): UseDownloadState {
     setUrlState(value);
   }, []);
 
+  const setMediaType = useCallback((value: MediaType) => {
+    setMediaTypeState(value);
+  }, []);
+
+  const setQuality = useCallback((value: VideoQuality) => {
+    setQualityState(value);
+  }, []);
+
   const trimmedUrl = url.trim();
   const canDownload =
     subscription === "active" &&
@@ -137,14 +162,14 @@ export function useDownload(): UseDownloadState {
     setErrorDetails(null);
     setStatus("downloading");
     try {
-      await startDownload(target);
+      await startDownload(buildDownloadRequest(target, mediaType, quality));
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
       setErrorMessage(friendlyErrorMessage(raw));
       setErrorDetails(raw);
       setStatus("error");
     }
-  }, [url]);
+  }, [url, mediaType, quality]);
 
   const handleReset = useCallback(() => {
     if (
@@ -165,6 +190,10 @@ export function useDownload(): UseDownloadState {
     subscription,
     url,
     setUrl,
+    mediaType,
+    setMediaType,
+    quality,
+    setQuality,
     progress,
     result,
     errorMessage,

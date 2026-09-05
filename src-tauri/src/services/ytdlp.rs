@@ -5,7 +5,7 @@
 //! frontend must not duplicate any of this.
 
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use tauri::{AppHandle, Emitter, Manager};
@@ -23,36 +23,126 @@ pub const FINAL_PATH_SENTINEL: &str = "YTDLP_GUI_FINAL_FILE ";
 
 const BINARY_FILE_NAME: &str = "yt-dlp.exe";
 
-/// Future-proof download options. The MVP only fills in `url` and
-/// `output_directory`; later features (quality, format, audio-only,
-/// subtitles, playlists, …) extend this struct instead of changing
+/// What to download: full video or native audio stream. Strongly typed so
+/// no raw string ever travels deep into the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaType {
+    Video,
+    Audio,
+}
+
+/// Video resolution presets. The frontend deals in these semantic values —
+/// never in yt-dlp format IDs or raw `-f` fragments. Unknown strings fail
+/// deserialization, so a malicious value can never become an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum VideoQuality {
+    #[serde(rename = "best")]
+    Best,
+    #[serde(rename = "2160")]
+    P2160,
+    #[serde(rename = "1440")]
+    P1440,
+    #[serde(rename = "1080")]
+    P1080,
+    #[serde(rename = "720")]
+    P720,
+    #[serde(rename = "480")]
+    P480,
+    #[serde(rename = "360")]
+    P360,
+}
+
+impl VideoQuality {
+    /// Maximum stream height in pixels, or `None` for unconstrained best.
+    fn max_height(self) -> Option<u32> {
+        match self {
+            VideoQuality::Best => None,
+            VideoQuality::P2160 => Some(2160),
+            VideoQuality::P1440 => Some(1440),
+            VideoQuality::P1080 => Some(1080),
+            VideoQuality::P720 => Some(720),
+            VideoQuality::P480 => Some(480),
+            VideoQuality::P360 => Some(360),
+        }
+    }
+}
+
+/// Structured download request from the frontend (camelCase over IPC).
+/// `quality` is meaningful for video only; audio requests must send `None`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartDownloadRequest {
+    pub url: String,
+    pub media_type: MediaType,
+    pub quality: Option<VideoQuality>,
+}
+
+/// Validated, backend-owned options. Later features (output directory
+/// picker, subtitles, playlists, …) extend this struct instead of changing
 /// call sites.
 #[derive(Debug, Clone)]
 #[allow(
     dead_code,
-    reason = "quality/format/subtitles/playlist are roadmap fields, MVP fills url + output_directory"
+    reason = "audio_only/subtitles/playlist are roadmap fields, phases 1 fills url + output_directory + media"
 )]
 pub struct DownloadOptions {
     pub url: String,
     pub output_directory: PathBuf,
-    pub quality: Option<String>,
-    pub format: Option<String>,
-    pub audio_only: bool,
+    pub media_type: MediaType,
+    /// Resolved quality for video; always `None` for audio.
+    pub quality: Option<VideoQuality>,
     pub subtitles: bool,
     pub playlist: bool,
 }
 
 impl DownloadOptions {
-    pub fn mvp(url: String, output_directory: PathBuf) -> Self {
+    pub fn new(
+        url: String,
+        output_directory: PathBuf,
+        media_type: MediaType,
+        quality: Option<VideoQuality>,
+    ) -> Self {
         Self {
             url,
             output_directory,
-            quality: None,
-            format: None,
-            audio_only: false,
+            media_type,
+            quality,
             subtitles: false,
             playlist: false,
         }
+    }
+}
+
+/// Validate a frontend request into backend-owned options. Rejects invalid
+/// combinations with understandable errors instead of panicking.
+pub fn validate_request(
+    request: &StartDownloadRequest,
+    output_directory: PathBuf,
+) -> Result<DownloadOptions, String> {
+    let url = request.url.trim().to_string();
+    if url.is_empty() {
+        return Err("Please paste a video URL first.".to_string());
+    }
+    match request.media_type {
+        MediaType::Audio => {
+            if request.quality.is_some() {
+                return Err("Audio downloads do not take a video quality.".to_string());
+            }
+            Ok(DownloadOptions::new(
+                url,
+                output_directory,
+                MediaType::Audio,
+                None,
+            ))
+        }
+        MediaType::Video => Ok(DownloadOptions::new(
+            url,
+            output_directory,
+            MediaType::Video,
+            // Default to Best when the frontend omits it.
+            Some(request.quality.unwrap_or(VideoQuality::Best)),
+        )),
     }
 }
 
@@ -164,6 +254,29 @@ pub fn resolve_downloads_dir() -> Result<PathBuf, String> {
     Err("Could not locate your Downloads folder.".to_string())
 }
 
+/// Convert media type + quality into a yt-dlp `-f` expression.
+///
+/// The ONLY place format strings are created. Selection is an exhaustive
+/// match over the enums — user input only picks a variant, and heights are
+/// compile-time constants, so a hostile frontend value can never become a
+/// raw format expression. No exact format IDs, no site-specific IDs.
+pub fn format_selector(media_type: MediaType, quality: Option<VideoQuality>) -> String {
+    match media_type {
+        // Best native audio stream in its source container/codec. No `-x`,
+        // no mp3 conversion: conversion needs FFmpeg and is a later phase.
+        MediaType::Audio => "ba/b".to_string(),
+        MediaType::Video => match quality.unwrap_or(VideoQuality::Best) {
+            VideoQuality::Best => "bv*+ba/b".to_string(),
+            preset => {
+                let height = preset
+                    .max_height()
+                    .expect("non-Best preset always has a height");
+                format!("bv*[height<={height}]+ba/b[height<={height}]")
+            }
+        },
+    }
+}
+
 /// Build the yt-dlp argument list in one place.
 ///
 /// The binary is executed directly with individual arguments (never via
@@ -186,17 +299,12 @@ pub fn build_download_args(options: &DownloadOptions) -> Vec<String> {
         // UI never mistakes a temporary video/audio stream file for the result.
         "--print".to_string(),
         format!("after_move:{FINAL_PATH_SENTINEL}%(filepath)s"),
+        "-f".to_string(),
+        format_selector(options.media_type, options.quality),
         "-o".to_string(),
         template,
     ];
 
-    if options.audio_only {
-        args.push("-x".to_string());
-    }
-    if let Some(format) = &options.format {
-        args.push("-f".to_string());
-        args.push(format.clone());
-    }
     if options.subtitles {
         args.push("--write-subs".to_string());
     }
@@ -350,14 +458,42 @@ fn file_name_of(path: &std::path::Path) -> Option<String> {
 /// Decide what the success UI reports: the real post-merge file when yt-dlp
 /// printed it, otherwise the last `[download] Destination:` filename, if any.
 /// The extension is never guessed or derived from stream filenames.
-fn resolve_result_filename(
-    final_path: Option<&std::path::Path>,
+///
+/// Crucially, the reported file must actually exist: yt-dlp can exit 0 while
+/// leaving streams unmerged (no FFmpeg), in which case claiming success
+/// would fake a file. A missing file becomes an honest, actionable error.
+fn resolve_verified_result(
+    final_path: Option<PathBuf>,
     destination_filename: Option<String>,
-) -> (Option<String>, Option<String>) {
-    match final_path {
-        Some(path) => (file_name_of(path), Some(path.to_string_lossy().to_string())),
-        None => (destination_filename, None),
+    downloads_dir: &std::path::Path,
+) -> Result<(Option<String>, Option<String>), String> {
+    if let Some(path) = final_path {
+        if path.is_file() {
+            let name = file_name_of(&path);
+            let full = path.to_string_lossy().to_string();
+            return Ok((name, Some(full)));
+        }
+        return Err(missing_file_message());
     }
+    match destination_filename {
+        Some(name) => {
+            let path = downloads_dir.join(&name);
+            if path.is_file() {
+                let full = path.to_string_lossy().to_string();
+                Ok((Some(name), Some(full)))
+            } else {
+                Err(missing_file_message())
+            }
+        }
+        None => Ok((None, None)),
+    }
+}
+
+fn missing_file_message() -> String {
+    "Download finished but the merged file is missing. FFmpeg is required \
+     to merge the separate streams — install FFmpeg or choose a format \
+     that does not require merging."
+        .to_string()
 }
 
 fn emit_progress(app: &AppHandle, progress: &DownloadProgress) {
@@ -374,7 +510,7 @@ fn emit_error(app: &AppHandle, error: &DownloadError) {
 
 /// Run one download to completion, streaming progress events.
 /// Intended to be spawned as a background task by the command layer.
-pub async fn run_download(app: AppHandle, url: String) {
+pub async fn run_download(app: AppHandle, options: DownloadOptions) {
     let binary = match resolve_ytdlp_path(&app) {
         Ok(path) => path,
         Err(message) => {
@@ -389,21 +525,7 @@ pub async fn run_download(app: AppHandle, url: String) {
         }
     };
 
-    let downloads_dir = match resolve_downloads_dir() {
-        Ok(dir) => dir,
-        Err(message) => {
-            emit_error(
-                &app,
-                &DownloadError {
-                    message: message.clone(),
-                    details: Some(message),
-                },
-            );
-            return;
-        }
-    };
-
-    let options = DownloadOptions::mvp(url, downloads_dir.clone());
+    let downloads_dir = options.output_directory.clone();
     let args = build_download_args(&options);
 
     let mut child = match tokio::process::Command::new(&binary)
@@ -503,16 +625,30 @@ pub async fn run_download(app: AppHandle, url: String) {
 
     match status {
         Ok(exit) if exit.success() => {
-            let (filename, filepath) =
-                resolve_result_filename(final_path.as_deref(), destination_filename);
-            emit_complete(
-                &app,
-                &DownloadResult {
-                    filename,
-                    filepath,
-                    downloads_dir: downloads_dir.to_string_lossy().to_string(),
-                },
-            );
+            match resolve_verified_result(final_path, destination_filename, &downloads_dir) {
+                Ok((filename, filepath)) => emit_complete(
+                    &app,
+                    &DownloadResult {
+                        filename,
+                        filepath,
+                        downloads_dir: downloads_dir.to_string_lossy().to_string(),
+                    },
+                ),
+                Err(message) => {
+                    let details = if stderr_text.trim().is_empty() {
+                        message.clone()
+                    } else {
+                        tail_text(&stderr_text, 2000)
+                    };
+                    emit_error(
+                        &app,
+                        &DownloadError {
+                            message,
+                            details: Some(details),
+                        },
+                    );
+                }
+            }
         }
         Ok(exit) => {
             let details = if stderr_text.trim().is_empty() {
@@ -630,18 +766,17 @@ mod tests {
     }
 
     #[test]
-    fn builds_mvp_args_without_shell_string() {
-        let options = DownloadOptions::mvp(
+    fn builds_video_best_args() {
+        let options = DownloadOptions::new(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
             PathBuf::from("C:\\Users\\Alex\\Downloads"),
+            MediaType::Video,
+            Some(VideoQuality::Best),
         );
         let args = build_download_args(&options);
         assert!(args.contains(&"--newline".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
-        // `--print` alone suppresses progress output; `--progress` keeps it.
         assert!(args.contains(&"--progress".to_string()));
-        // The final-path report must travel as its own argv element and the
-        // URL must remain exactly one trailing argument (no shell join).
         assert!(args.contains(&"--print".to_string()));
         assert!(
             args.iter()
@@ -649,6 +784,10 @@ mod tests {
             "args must request the post-move filepath, got: {:?}",
             args
         );
+        // Best video: highest-quality video+audio result.
+        let format = format_value(&args);
+        assert_eq!(format, "bv*+ba/b");
+        // URL remains exactly one trailing argument (no shell join).
         let url_args = args
             .iter()
             .filter(|a| a.as_str() == "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -667,6 +806,176 @@ mod tests {
         assert!(template.contains("%(title)s"));
         assert!(template.contains("%(id)s"));
         assert!(template.contains("%(ext)s"));
+    }
+
+    /// Fetch the `-f` value from a built argument list.
+    fn format_value(args: &[String]) -> &str {
+        args.iter()
+            .skip_while(|a| a.as_str() != "-f")
+            .nth(1)
+            .expect("-f must carry a format expression")
+    }
+
+    #[test]
+    fn builds_video_quality_args() {
+        for (quality, height) in [
+            (VideoQuality::P2160, 2160),
+            (VideoQuality::P1440, 1440),
+            (VideoQuality::P1080, 1080),
+            (VideoQuality::P720, 720),
+            (VideoQuality::P480, 480),
+            (VideoQuality::P360, 360),
+        ] {
+            let options = DownloadOptions::new(
+                "https://example.com/v".to_string(),
+                PathBuf::from("C:\\dl"),
+                MediaType::Video,
+                Some(quality),
+            );
+            let args = build_download_args(&options);
+            let format = format_value(&args);
+            // Constrained best video + best audio, with a progressive
+            // fallback when separate streams are unavailable.
+            assert!(
+                format.contains(&format!("height<={height}")),
+                "quality {:?} must constrain height, got: {}",
+                quality,
+                format
+            );
+            assert!(
+                format.contains("+ba"),
+                "quality {:?} must include best audio, got: {}",
+                quality,
+                format
+            );
+            assert!(
+                format.contains('/'),
+                "quality {:?} must keep a fallback, got: {}",
+                quality,
+                format
+            );
+        }
+    }
+
+    #[test]
+    fn builds_audio_args_without_conversion() {
+        let options = DownloadOptions::new(
+            "https://example.com/v".to_string(),
+            PathBuf::from("C:\\dl"),
+            MediaType::Audio,
+            None,
+        );
+        let args = build_download_args(&options);
+        let format = format_value(&args);
+        // Best native audio stream; never a conversion flag.
+        assert_eq!(format, "ba/b");
+        assert!(
+            !args.iter().any(|a| a == "-x"
+                || a == "--extract-audio"
+                || a == "--audio-format"
+                || a == "mp3"),
+            "audio mode must not convert, got: {:?}",
+            args
+        );
+        assert!(
+            !args.iter().any(|a| a.contains("height")),
+            "audio mode takes no quality constraint, got: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn format_selector_covers_all_modes() {
+        assert_eq!(
+            format_selector(MediaType::Video, Some(VideoQuality::Best)),
+            "bv*+ba/b"
+        );
+        assert_eq!(
+            format_selector(MediaType::Video, None),
+            "bv*+ba/b",
+            "missing quality defaults to best"
+        );
+        assert_eq!(
+            format_selector(MediaType::Video, Some(VideoQuality::P1080)),
+            "bv*[height<=1080]+ba/b[height<=1080]"
+        );
+        assert_eq!(
+            format_selector(MediaType::Video, Some(VideoQuality::P720)),
+            "bv*[height<=720]+ba/b[height<=720]"
+        );
+        assert_eq!(format_selector(MediaType::Audio, None), "ba/b");
+        // Even a stray quality with audio resolves to plain best audio.
+        assert_eq!(
+            format_selector(MediaType::Audio, Some(VideoQuality::P1080)),
+            "ba/b"
+        );
+    }
+
+    #[test]
+    fn hostile_strings_cannot_become_format_args() {
+        // Unknown media types and qualities fail deserialization outright.
+        assert!(serde_json::from_str::<MediaType>("\"video \"").is_err());
+        assert!(serde_json::from_str::<MediaType>("\"hacker\"").is_err());
+        assert!(serde_json::from_str::<VideoQuality>("\"137\"").is_err());
+        assert!(serde_json::from_str::<VideoQuality>("\"1080;evil\"").is_err());
+        assert!(serde_json::from_str::<VideoQuality>("\"bestvideo+bestaudio\"").is_err());
+        // A full hostile request is rejected before any argument is built.
+        let hostile =
+            r#"{"url":"https://example.com/v","mediaType":"video","quality":"bv*+ba; rm -rf ~"}"#;
+        assert!(serde_json::from_str::<StartDownloadRequest>(hostile).is_err());
+        // Valid spellings still parse.
+        let ok: StartDownloadRequest = serde_json::from_str(
+            r#"{"url":"https://example.com/v","mediaType":"audio","quality":null}"#,
+        )
+        .expect("valid request must parse");
+        assert_eq!(ok.media_type, MediaType::Audio);
+        assert_eq!(ok.quality, None);
+    }
+
+    #[test]
+    fn validate_request_rejects_audio_with_quality() {
+        let request = StartDownloadRequest {
+            url: "https://example.com/v".to_string(),
+            media_type: MediaType::Audio,
+            quality: Some(VideoQuality::P1080),
+        };
+        let err = validate_request(&request, PathBuf::from("C:\\dl"))
+            .expect_err("audio + quality must be rejected");
+        assert!(err.contains("quality"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn validate_request_accepts_valid_combinations() {
+        let video = StartDownloadRequest {
+            url: "  https://example.com/v  ".to_string(),
+            media_type: MediaType::Video,
+            quality: Some(VideoQuality::P720),
+        };
+        let options = validate_request(&video, PathBuf::from("C:\\dl"))
+            .expect("video + quality must validate");
+        assert_eq!(options.url, "https://example.com/v");
+        assert_eq!(options.media_type, MediaType::Video);
+        assert_eq!(options.quality, Some(VideoQuality::P720));
+
+        // Omitted video quality defaults to Best.
+        let defaulted = StartDownloadRequest {
+            url: "https://example.com/v".to_string(),
+            media_type: MediaType::Video,
+            quality: None,
+        };
+        let options = validate_request(&defaulted, PathBuf::from("C:\\dl"))
+            .expect("video without quality must default");
+        assert_eq!(options.quality, Some(VideoQuality::Best));
+
+        let audio = StartDownloadRequest {
+            url: "https://example.com/v".to_string(),
+            media_type: MediaType::Audio,
+            quality: None,
+        };
+        let options =
+            validate_request(&audio, PathBuf::from("C:\\dl")).expect("audio must validate");
+        assert_eq!(options.media_type, MediaType::Audio);
+        assert_eq!(options.quality, None);
     }
 
     #[test]
@@ -718,25 +1027,52 @@ mod tests {
         }
         assert_eq!(current.as_deref(), Some("video [abc123].f140.m4a"));
 
-        let final_path = parse_final_path_line(
-            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\video [abc123].mp4",
-        )
-        .expect("must parse");
-        let (filename, filepath) = resolve_result_filename(Some(final_path.as_path()), current);
-        assert_eq!(filename.as_deref(), Some("video [abc123].mp4"));
+        let dir = std::env::temp_dir();
+        let final_path = dir.join("ytdlp_gui_test_final.mp4");
+        std::fs::write(&final_path, b"fake video").expect("test file");
+        let (filename, filepath) = resolve_verified_result(Some(final_path.clone()), current, &dir)
+            .expect("existing final file must verify");
+        assert_eq!(filename.as_deref(), Some("ytdlp_gui_test_final.mp4"));
         assert_eq!(
             filepath.as_deref(),
-            Some("C:\\Users\\Alex\\Downloads\\video [abc123].mp4")
+            Some(final_path.to_string_lossy().as_ref())
         );
+        std::fs::remove_file(&final_path).ok();
+    }
+
+    #[test]
+    fn phantom_merged_file_becomes_ffmpeg_error() {
+        // yt-dlp exits 0 but the after_move file was never created (streams
+        // left unmerged without FFmpeg): success must NOT be faked.
+        let dir = std::env::temp_dir();
+        let phantom = dir.join("ytdlp_gui_test_phantom_xyz.mp4");
+        assert!(!phantom.exists());
+        let err = resolve_verified_result(Some(phantom), None, &dir)
+            .expect_err("missing final file must error");
+        assert!(
+            err.contains("FFmpeg"),
+            "error must guide toward FFmpeg, got: {}",
+            err
+        );
+        // The message already reads user-friendly and maps to the frontend
+        // FFmpeg guidance (contains "FFmpeg" + "required").
+        assert!(err.contains("required"));
     }
 
     #[test]
     fn missing_final_path_falls_back_to_destination() {
-        let (filename, filepath) = resolve_result_filename(None, Some("video.mp4".to_string()));
-        assert_eq!(filename.as_deref(), Some("video.mp4"));
-        assert_eq!(filepath, None);
+        let dir = std::env::temp_dir();
+        let dest = dir.join("ytdlp_gui_test_dest.mp4");
+        std::fs::write(&dest, b"fake video").expect("test file");
+        let (filename, filepath) =
+            resolve_verified_result(None, Some("ytdlp_gui_test_dest.mp4".to_string()), &dir)
+                .expect("existing destination must verify");
+        assert_eq!(filename.as_deref(), Some("ytdlp_gui_test_dest.mp4"));
+        assert_eq!(filepath.as_deref(), Some(dest.to_string_lossy().as_ref()));
+        std::fs::remove_file(&dest).ok();
 
-        let (filename, filepath) = resolve_result_filename(None, None);
+        let (filename, filepath) =
+            resolve_verified_result(None, None, &dir).expect("no info must stay empty success");
         assert_eq!(filename, None);
         assert_eq!(filepath, None);
     }

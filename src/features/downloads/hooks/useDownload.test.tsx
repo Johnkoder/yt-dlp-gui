@@ -77,7 +77,11 @@ describe("useDownload event readiness", () => {
     });
     expect(mockInvoke).toHaveBeenCalledTimes(1);
     expect(mockInvoke).toHaveBeenCalledWith("start_download", {
-      url: "https://example.com/video",
+      request: {
+        url: "https://example.com/video",
+        mediaType: "video",
+        quality: "best",
+      },
     });
     expect(result.current.status).toBe("downloading");
   });

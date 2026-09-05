@@ -1,24 +1,33 @@
 # yt-dlp GUI
 
-A Windows desktop app that downloads videos without the command line.
-Paste a URL, press **Download Video**, watch real progress, and find the
+A Windows desktop app that downloads videos and audio without the
+command line.
+Paste a URL, press **Download**, watch real progress, and find the
 file in your Downloads folder.
 
 **yt-dlp** does the actual downloading — this app is a native GUI around
 the `yt-dlp.exe` binary, which is bundled as an application resource.
 
-## Current MVP features
+## Current features
 
 - Paste a video URL and download it with one click (Enter works too)
+- Download type: **Video** or native **Audio** (best source audio stream,
+  kept in its original container such as `.m4a`/`.webm` — MP3 conversion
+  is not implemented yet)
+- Video quality presets: **Best / 2160p / 1440p / 1080p / 720p / 480p /
+  360p** (best stream at or below the chosen height, plus best audio,
+  with a fallback when separate streams are unavailable)
 - Real, live progress parsed from yt-dlp output: percentage, speed, ETA,
   filename — never faked
 - Videos saved to the user's Windows Downloads folder
   (`%(title)s [%(id)s].%(ext)s` naming)
+- High-quality video may need FFmpeg to merge separate streams; a missing
+  FFmpeg produces an understandable error, never a fake file
 - Clear success state with an **Open Downloads** button
-- Understandable errors (bad URL, unavailable/private video, HTTP and
-  network failures, missing yt-dlp binary, missing Deno) with stderr
-  details in the UI
-- Single-download guard so concurrent MVP downloads can't collide
+- Understandable errors (bad URL, unavailable/private video, unavailable
+  quality, missing FFmpeg, HTTP and network failures, missing yt-dlp
+  binary, missing Deno) with stderr details in the UI
+- Single-download guard so concurrent downloads can't collide
 
 ## Tech stack
 
@@ -60,10 +69,11 @@ yt-dlp.exe  (direct execution, one argv element per argument)
   registered — a download can never start with nowhere to report to.
 - A restrictive Content Security Policy is configured (no remote
   scripts; Tauri appends its compile-time hashes/nonces automatically).
-- Argument construction lives in `build_download_args()` and binary
-  discovery in `resolve_ytdlp_path()` — one place each, ready to grow
-  (`DownloadOptions` already carries future `quality` / `format` /
-  `audio_only` / `subtitles` / `playlist` fields).
+- Argument construction lives in `build_download_args()` (with the
+  `format_selector()` media/quality mapping) and binary discovery in
+  `resolve_ytdlp_path()` — one place each, ready to grow
+  (`DownloadOptions` carries `media_type` / `quality` plus future
+  `subtitles` / `playlist` fields).
 
 ## Folder structure
 
@@ -71,10 +81,12 @@ yt-dlp.exe  (direct execution, one argv element per argument)
 yt-dlp-gui/
 ├── src/
 │   ├── components/            # UrlInput, DownloadButton,
-│   │                          # DownloadProgress, StatusMessage
+│   │                          # DownloadProgress, StatusMessage,
+│   │                          # MediaTypeSelector, QualitySelector
 │   ├── features/downloads/
-│   │   ├── hooks/useDownload.ts   # idle|downloading|success|error machine
+│   │   ├── hooks/useDownload.ts   # initializing|ready|downloading|success|error
 │   │   ├── downloadService.ts     # Tauri invoke/listen wrapper + error map
+│   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
 │   │   └── types.ts
 │   ├── styles/                # variables.css, globals.css
 │   ├── App.tsx                # composes components (no business logic)
@@ -180,10 +192,17 @@ cargo test             # needs MSVC link.exe on Windows
 
 ## Future roadmap
 
-Download queue · multiple simultaneous downloads · quality selection ·
-audio-only/MP3 · output folder selection · subtitles · thumbnails ·
-metadata · playlists · history · cancellation · settings · yt-dlp
-self-updates · FFmpeg management · dependency checks.
+Completed:
+- quality selector (Best / 2160p–360p presets)
+- video / native-audio download mode
+
+Next:
+- output folder selection
+- dependency detection (FFmpeg / Deno status screen)
+- audio format conversion (MP3, …)
+- download queue · multiple simultaneous downloads · playlists ·
+  history · cancellation · settings · yt-dlp self-updates · FFmpeg
+  management
 
 ## License
 

@@ -3,7 +3,7 @@
 //! The frontend invokes these commands and listens for progress events.
 //! Argument construction and process management live in
 //! `crate::services::ytdlp`; this module only validates input, guards
-//! concurrent MVP downloads, and spawns the background task.
+//! concurrent downloads, and spawns the background task.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -11,11 +11,11 @@ use std::sync::{
 };
 use tauri::{AppHandle, State};
 
-use crate::services::ytdlp;
+use crate::services::ytdlp::{self, StartDownloadRequest};
 
-/// MVP guard: one active download at a time. Structured as managed state
-/// so it can later become a queue / multi-download tracker without
-/// changing the command signatures' shape.
+/// Single-download guard. Structured as managed state so it can later
+/// become a queue / multi-download tracker without changing the command
+/// signatures' shape.
 pub struct DownloadState {
     pub active: Arc<AtomicBool>,
 }
@@ -33,26 +33,25 @@ fn is_valid_http_url(url: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() <= 2048
 }
 
-/// Start a download in the background. Returns immediately; progress,
-/// completion, and failure are delivered via Tauri events so the UI
-/// never blocks.
+/// Start a download in the background. Takes a structured request (never a
+/// bag of flags); values are re-validated in Rust and never trusted blindly.
+/// Returns immediately; progress, completion, and failure are delivered via
+/// Tauri events so the UI never blocks.
 #[tauri::command]
 pub async fn start_download(
     app: AppHandle,
     state: State<'_, DownloadState>,
-    url: String,
+    request: StartDownloadRequest,
 ) -> Result<(), String> {
-    let trimmed = url.trim().to_string();
-    if trimmed.is_empty() {
-        return Err("Please paste a video URL first.".to_string());
-    }
-    if !is_valid_http_url(&trimmed) {
+    if !is_valid_http_url(request.url.trim()) {
         return Err("That does not look like a valid http(s) URL.".to_string());
     }
     // Fail fast if the binary is missing so the user gets an immediate,
     // understandable error instead of a silent background failure.
     ytdlp::resolve_ytdlp_path(&app)?;
-    ytdlp::resolve_downloads_dir()?;
+    let downloads_dir = ytdlp::resolve_downloads_dir()?;
+
+    let options = ytdlp::validate_request(&request, downloads_dir)?;
 
     let active = state.active.clone();
     if active
@@ -63,7 +62,7 @@ pub async fn start_download(
     }
 
     tokio::spawn(async move {
-        ytdlp::run_download(app.clone(), trimmed).await;
+        ytdlp::run_download(app.clone(), options).await;
         active.store(false, Ordering::SeqCst);
     });
 

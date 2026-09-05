@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { DownloadRequest } from "./options";
 import type {
   DownloadError,
   DownloadProgressEvent,
@@ -19,16 +20,19 @@ export interface DownloadEventHandlers {
 /**
  * Thin wrapper over Tauri commands/events for downloads.
  *
- * The React layer never builds shell strings or spawns processes itself.
- * All yt-dlp argument construction and process execution lives in the
- * Rust backend (`src-tauri/src/services/ytdlp.rs`).
+ * The React layer sends semantic options (media type, quality preset) and
+ * never builds shell strings or yt-dlp arguments. All argument
+ * construction and process execution lives in the Rust backend
+ * (`src-tauri/src/services/ytdlp.rs`).
  */
-export async function startDownload(url: string): Promise<void> {
-  const trimmed = url.trim();
-  if (trimmed.length === 0) {
+export async function startDownload(request: DownloadRequest): Promise<void> {
+  const url = request.url.trim();
+  if (url.length === 0) {
     throw new Error("Please paste a video URL first.");
   }
-  await invoke("start_download", { url: trimmed });
+  await invoke("start_download", {
+    request: { ...request, url },
+  });
 }
 
 export async function openDownloadsFolder(): Promise<void> {
@@ -41,6 +45,21 @@ export async function getDownloadsDir(): Promise<string> {
 
 export function friendlyErrorMessage(raw: string): string {
   const lower = raw.toLowerCase();
+  if (
+    lower.includes("ffmpeg") &&
+    (lower.includes("not installed") ||
+      lower.includes("not found") ||
+      lower.includes("required"))
+  ) {
+    return "FFmpeg is required to merge this video quality. Install FFmpeg or choose a format that does not require merging.";
+  }
+  if (
+    lower.includes("requested format is not available") ||
+    lower.includes("no video formats found") ||
+    lower.includes("no audio formats found")
+  ) {
+    return "The requested quality is not available for this video. Try Best quality.";
+  }
   if (
     lower.includes("unsupported url") ||
     lower.includes("not a valid url") ||

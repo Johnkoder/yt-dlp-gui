@@ -1,5 +1,7 @@
 import { DownloadButton } from "./components/DownloadButton";
 import { DownloadProgress } from "./components/DownloadProgress";
+import { MediaTypeSelector } from "./components/MediaTypeSelector";
+import { QualitySelector } from "./components/QualitySelector";
 import { StatusMessage } from "./components/StatusMessage";
 import { UrlInput } from "./components/UrlInput";
 import { useDownload } from "./features/downloads/hooks/useDownload";
@@ -11,6 +13,10 @@ export default function App() {
     subscription,
     url,
     setUrl,
+    mediaType,
+    setMediaType,
+    quality,
+    setQuality,
     progress,
     result,
     errorMessage,
@@ -23,6 +29,16 @@ export default function App() {
   const isInitializing = status === "initializing";
   const isDownloading = status === "downloading";
   const backendUnreachable = subscription === "failed";
+  const optionsLocked = isDownloading || isInitializing;
+  const isAudio = mediaType === "audio";
+  // While downloading the button falls back to its internal "Downloading…".
+  const actionLabel = isInitializing
+    ? "Loading…"
+    : isDownloading
+      ? undefined
+      : isAudio
+        ? "Download Audio"
+        : "Download Video";
 
   return (
     <div className="app">
@@ -46,13 +62,27 @@ export default function App() {
           value={url}
           onChange={setUrl}
           onSubmit={handleDownload}
-          disabled={isDownloading || isInitializing}
+          disabled={optionsLocked}
         />
+
+        <MediaTypeSelector
+          value={mediaType}
+          onChange={setMediaType}
+          disabled={optionsLocked}
+        />
+
+        {!isAudio && (
+          <QualitySelector
+            value={quality}
+            onChange={setQuality}
+            disabled={optionsLocked}
+          />
+        )}
 
         <DownloadButton
           disabled={!canDownload}
           loading={isDownloading || isInitializing}
-          label={isInitializing ? "Loading…" : undefined}
+          label={actionLabel}
           onClick={handleDownload}
         />
 
