@@ -312,18 +312,36 @@ pub fn format_selector(media_type: MediaType, quality: Option<VideoQuality>) -> 
     }
 }
 
+/// Escape a literal filesystem path for use inside an argument that yt-dlp
+/// interprets with output-template syntax (`-o`, `--print-to-file` FILE).
+/// A literal `%` must become `%%`; real yt-dlp placeholders such as
+/// `%(title)s` are never passed through this helper, so they stay intact.
+/// Only the STRING sent to yt-dlp is escaped — the `PathBuf` used by Rust
+/// filesystem APIs is never mutated.
+fn escape_template_literal(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
 /// Build the yt-dlp argument list in one place.
 ///
 /// The binary is executed directly with individual arguments (never via
-/// `cmd.exe /c` with a concatenated string), so the URL and the output
-/// template each travel as a single argv element — no quoting or injection
-/// concerns, whatever characters the folder contains.
+/// `cmd.exe /c` with a concatenated string), so the URL, the output
+/// template, and the sidecar path each travel as a single argv element —
+/// no quoting or injection concerns, whatever characters the folder
+/// contains.
 pub fn build_download_args(options: &DownloadOptions, final_path_file: &Path) -> Vec<String> {
-    let template = options
+    // Only the literal directory is escaped; the filename placeholders
+    // below must keep their single `%` to stay functional.
+    let dir = options
         .output_directory
-        .join("%(title)s [%(id)s].%(ext)s")
         .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
         .to_string();
+    let template = format!(
+        "{}{}%(title)s [%(id)s].%(ext)s",
+        escape_template_literal(&dir),
+        std::path::MAIN_SEPARATOR,
+    );
 
     let mut args = vec![
         "--newline".to_string(),
@@ -337,7 +355,9 @@ pub fn build_download_args(options: &DownloadOptions, final_path_file: &Path) ->
         // stdout mangles non-ANSI characters, while file I/O is exact.
         "--print-to-file".to_string(),
         "after_move:%(filepath)s".to_string(),
-        final_path_file.to_string_lossy().to_string(),
+        // The FILE operand is template syntax too: escape a literal `%`
+        // from temp dirs. The Rust `PathBuf` itself stays unmutated.
+        escape_template_literal(&final_path_file.to_string_lossy()),
         "-f".to_string(),
         format_selector(options.media_type, options.quality),
         "-o".to_string(),
@@ -360,12 +380,14 @@ fn final_path_sidecar() -> PathBuf {
     std::env::temp_dir().join(format!("ytdlp-gui-final-{}-{}.txt", std::process::id(), n))
 }
 
-/// Read the final path back: last non-empty line, CRLF tolerant. The file is
-/// deleted either way; a missing or unreadable file yields `None`.
+/// Read the final path back: last non-empty line, CRLF tolerant.
+/// Deletion is attempted whether reading succeeds or not; a missing or
+/// unreadable file yields `None` without panicking.
 fn read_final_path_file(path: &Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let text = std::fs::read_to_string(path);
     let _ = std::fs::remove_file(path);
-    text.lines()
+    text.ok()?
+        .lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty())
         .map(PathBuf::from)
@@ -1070,9 +1092,10 @@ mod tests {
 
     #[test]
     fn output_template_uses_custom_directory() {
-        // Spaces, parentheses, and Unicode stay intact inside the single
-        // template argument.
-        let base = std::env::temp_dir().join("My Videos (2026) 日本語 🎬");
+        // Spaces, parentheses, Unicode, emoji, AND a literal `%` stay
+        // intact inside the single template argument; only the literal
+        // directory `%` is escaped, never the yt-dlp placeholders.
+        let base = std::env::temp_dir().join("My 100% Videos (2026) 日本語 🎬");
         std::fs::create_dir_all(&base).expect("test dir");
         let options = DownloadOptions::new(
             "https://example.com/v".to_string(),
@@ -1086,17 +1109,72 @@ mod tests {
             .skip_while(|a| a.as_str() != "-o")
             .nth(1)
             .expect("-o must carry a template");
-        let expected_prefix = base.to_string_lossy().to_string();
         assert!(
-            template.starts_with(&expected_prefix),
-            "template must live under the custom dir, got: {}",
+            template.contains("100%% Videos"),
+            "literal % must be escaped, got: {}",
             template
         );
+        for placeholder in ["%(title)s", "%(id)s", "%(ext)s"] {
+            assert!(
+                template.contains(placeholder),
+                "placeholder must stay intact, got: {}",
+                template
+            );
+        }
+        for doubled in ["%%(title)s", "%%(id)s", "%%(ext)s"] {
+            assert!(
+                !template.contains(doubled),
+                "placeholders must not be double-escaped, got: {}",
+                template
+            );
+        }
         assert!(template.ends_with("%(title)s [%(id)s].%(ext)s"));
         // Template and URL each remain exactly one argv element.
         assert_eq!(args.iter().filter(|a| a.as_str() == "-o").count(), 1);
         assert_eq!(args.last().unwrap(), "https://example.com/v");
         std::fs::remove_dir(&base).ok();
+    }
+
+    #[test]
+    fn escape_template_literal_only_touches_percent() {
+        assert_eq!(
+            escape_template_literal("D:\\100% Videos"),
+            "D:\\100%% Videos"
+        );
+        assert_eq!(escape_template_literal("plain"), "plain");
+        assert_eq!(escape_template_literal("100%%"), "100%%%%");
+        // Placeholders are never fed through the helper by construction;
+        // documented here so the invariant stays visible.
+        assert_eq!(escape_template_literal("%(title)s"), "%%(title)s");
+    }
+
+    #[test]
+    fn sidecar_argument_escapes_literal_percent() {
+        // A `%` in the temp dir must reach yt-dlp escaped, while the real
+        // PathBuf — used for reading/deleting — keeps the single `%`.
+        let sidecar = PathBuf::from("C:\\Temp\\100% test\\final.txt");
+        let options = DownloadOptions::new(
+            "https://example.com/v".to_string(),
+            PathBuf::from("C:\\dl"),
+            MediaType::Audio,
+            None,
+        );
+        let args = build_download_args(&options, &sidecar);
+        let position = args
+            .iter()
+            .position(|a| a == "--print-to-file")
+            .expect("print-to-file present");
+        assert_eq!(args[position + 1], "after_move:%(filepath)s");
+        assert!(
+            args[position + 2].contains("100%% test"),
+            "sidecar % must be escaped, got: {}",
+            args[position + 2]
+        );
+        assert_eq!(
+            sidecar.to_string_lossy(),
+            "C:\\Temp\\100% test\\final.txt",
+            "real path must keep the single %"
+        );
     }
 
     #[test]
@@ -1120,6 +1198,19 @@ mod tests {
         let empty = std::env::temp_dir().join("ytdlp_gui_test_sidecar_empty.txt");
         std::fs::write(&empty, "  \r\n").expect("test file");
         assert_eq!(read_final_path_file(&empty), None);
+    }
+
+    #[test]
+    fn sidecar_cleanup_attempted_even_when_unreadable() {
+        // A directory cannot be read as a file: must yield None rather than
+        // panic, and the failed delete attempt must be harmless.
+        let dir = std::env::temp_dir();
+        assert_eq!(read_final_path_file(&dir), None);
+        assert!(dir.exists(), "temp dir must be untouched");
+        assert_eq!(
+            read_final_path_file(&dir.join("ytdlp_gui_no_sidecar_xyz.txt")),
+            None
+        );
     }
 
     #[test]
