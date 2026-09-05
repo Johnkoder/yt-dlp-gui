@@ -195,6 +195,92 @@ describe("useDownloadQueue", () => {
     );
   });
 
+  it("unrelated start keeps the pending snapshot for its own job", async () => {
+    // Race B: Job 1 downloading, Job 2 queued, Job 3 enqueue in flight.
+    // Job 1 finishes and Job 2 starts BEFORE Job 3's response resolves.
+    // Job 2's started event must not consume Job 3's pending snapshot.
+    let resolveEnqueue!: (value: unknown) => void;
+    const handlers = new Map<string, Handler>();
+    mockListen.mockImplementation((event: string, handler: Handler) => {
+      handlers.set(event, handler);
+      return Promise.resolve(vi.fn());
+    });
+    let nextJobId = 1;
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") {
+        return Promise.resolve(TEST_DIR);
+      }
+      if (command === "enqueue_download") {
+        // First two enqueues resolve immediately; the third stays pending.
+        if (nextJobId < 3) {
+          const jobId = nextJobId;
+          nextJobId += 1;
+          return Promise.resolve({ jobId });
+        }
+        return new Promise((resolve) => {
+          resolveEnqueue = resolve;
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    // Enqueue Job 1 and Job 2 (resolve at once).
+    act(() => {
+      result.current.setUrl("https://example.com/job-1");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+    act(() => {
+      result.current.setUrl("https://example.com/job-2");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+    await fire(handlers, "download-started", { jobId: 1 });
+    expect(result.current.jobs[0].status).toBe("downloading");
+    expect(result.current.jobs[1].status).toBe("queued");
+
+    // Start enqueueing Job 3 with unique values; keep it unresolved.
+    act(() => {
+      result.current.setUrl("https://example.com/job-3");
+      result.current.setMediaType("audio");
+      result.current.setAudioFormat("mp3");
+      result.current.setOutputDirectory("D:\\Job 3 Music");
+    });
+    let enqueuePromise!: Promise<void>;
+    act(() => {
+      enqueuePromise = result.current.enqueueCurrentDraft();
+    });
+
+    // Job 1 finishes and Job 2 starts before Job 3's response.
+    await fire(handlers, "download-started", { jobId: 2 });
+    expect(result.current.jobs[1].status).toBe("downloading");
+
+    // Now resolve Job 3's enqueue response.
+    await act(async () => {
+      resolveEnqueue({ jobId: 3 });
+      await enqueuePromise;
+    });
+
+    // No duplicate rows; IDs stay in order.
+    const jobs = result.current.jobs;
+    expect(jobs.map((job) => job.id)).toEqual([1, 2, 3]);
+    // Job 2 did NOT receive Job 3's snapshot (it keeps its own).
+    expect(jobs[1].request?.url).toBe("https://example.com/job-2");
+    // Job 3 exists exactly once with its full snapshot intact.
+    const job3 = jobs[2];
+    expect(job3.status).toBe("queued");
+    expect(job3.request).not.toBeNull();
+    expect(job3.request?.url).toBe("https://example.com/job-3");
+    expect(job3.request?.mediaType).toBe("audio");
+    expect(job3.request?.audioFormat).toBe("mp3");
+    expect(job3.request?.quality).toBeNull();
+    expect(job3.request?.outputDirectory).toBe("D:\\Job 3 Music");
+  });
+
   it("progress routes to the matching job only", async () => {
     const handlers = setupActive({ value: 1 });
     const { result } = renderHook(() => useDownloadQueue());

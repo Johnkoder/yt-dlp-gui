@@ -157,13 +157,16 @@ export function useDownloadQueue(): UseQueueState {
       onStarted: (event: DownloadStartedEvent) => {
         if (cancelled) return;
         const { jobId } = event;
-        // Consume the in-flight snapshot if this started event won the race
-        // against the enqueue response.
+        // Read the in-flight snapshot once; it is consumed below ONLY when
+        // this event is for an unknown job that genuinely needs it. An
+        // existing job (queued → downloading, duplicates, terminal rows)
+        // must never touch it — otherwise an unrelated job starting while
+        // another enqueue is in flight would steal that job's snapshot.
         const snapshot = pendingRef.current;
-        pendingRef.current = null;
         setJobs((prev) => {
           const index = prev.findIndex((job) => job.id === jobId);
           if (index === -1) {
+            pendingRef.current = null;
             return [...prev, emptyJob(jobId, snapshot, "downloading")];
           }
           const job = prev[index];
@@ -173,7 +176,6 @@ export function useDownloadQueue(): UseQueueState {
           const next = [...prev];
           next[index] = {
             ...job,
-            request: job.request ?? snapshot,
             status: "downloading",
           };
           return next;
