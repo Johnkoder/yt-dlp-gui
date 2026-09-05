@@ -182,23 +182,92 @@ async fn check_ytdlp(app: &AppHandle) -> DependencyInfo {
     }
 }
 
-fn deno_candidates() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(path_var) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path_var));
+/// How a Deno installation was found. Shared by the dependency checker and
+/// the yt-dlp launcher so "Available" always means "usable by downloads".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenoSource {
+    /// Found via normal PATH lookup: children inherit it unchanged.
+    OnPath,
+    /// Found only at the per-user fallback: the yt-dlp child process needs
+    /// the containing directory prepended to its own PATH.
+    UserFallback,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDeno {
+    pub path: PathBuf,
+    pub source: DenoSource,
+}
+
+const DENO_FILE_NAME: &str = "deno.exe";
+
+/// Resolve Deno against explicit directory lists. Pure over its inputs so
+/// tests pass temp dirs directly: PATH dirs win, the fallback dir is only
+/// consulted when PATH has no Deno.
+pub fn resolve_deno_in(path_dirs: &[PathBuf], fallback_dir: Option<&Path>) -> Option<ResolvedDeno> {
+    if let Some(path) = find_executable_in_dirs(DENO_FILE_NAME, path_dirs) {
+        return Some(ResolvedDeno {
+            path,
+            source: DenoSource::OnPath,
+        });
     }
-    // Standard per-user install location as a fallback (never assumed).
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".deno").join("bin"));
+    let dir = fallback_dir?;
+    let path = dir.join(DENO_FILE_NAME);
+    if path.is_file() {
+        Some(ResolvedDeno {
+            path,
+            source: DenoSource::UserFallback,
+        })
+    } else {
+        None
     }
-    dirs
+}
+
+/// Resolve Deno in the real environment: normal PATH first, then the
+/// standard per-user install location.
+pub fn resolve_deno() -> Option<ResolvedDeno> {
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    let fallback = dirs::home_dir().map(|home| home.join(".deno").join("bin"));
+    resolve_deno_in(&path_dirs, fallback.as_deref())
+}
+
+/// Build a child-process PATH with `dir` prepended, preserving every
+/// existing entry. Uses the platform split/join helpers (no manual `;`
+/// concatenation), skips prepending when already present, and tolerates
+/// spaces and Unicode. The result is meant for one
+/// `Command::env("PATH", …)` call — the system environment is never
+/// modified.
+pub fn prepend_to_path_list(
+    existing: Option<std::ffi::OsString>,
+    dir: &Path,
+) -> Result<std::ffi::OsString, String> {
+    let mut dirs: Vec<PathBuf> = existing
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    if !dirs.iter().any(|candidate| candidate == dir) {
+        dirs.insert(0, dir.to_path_buf());
+    }
+    std::env::join_paths(dirs).map_err(|err| format!("Could not build PATH value: {}", err))
+}
+
+/// Directory the yt-dlp child process needs on its own PATH so it can
+/// discover Deno, if any: `Some` only when Deno exists solely at the user
+/// fallback (PATH installations need no adjustment).
+pub fn deno_child_path_dir() -> Option<PathBuf> {
+    match resolve_deno() {
+        Some(deno) if deno.source == DenoSource::UserFallback => {
+            deno.path.parent().map(Path::to_path_buf)
+        }
+        _ => None,
+    }
 }
 
 async fn check_deno() -> DependencyInfo {
     const NAME: &str = "Deno";
-    const FILE: &str = "deno.exe";
-    let binary = match find_executable_in_dirs(FILE, &deno_candidates()) {
-        Some(path) => path,
+    let deno = match resolve_deno() {
+        Some(resolved) => resolved,
         None => {
             return missing(
                 NAME,
@@ -206,6 +275,7 @@ async fn check_deno() -> DependencyInfo {
             );
         }
     };
+    let binary = deno.path;
     match run_version_command(&binary, &["--version"], VERSION_TIMEOUT).await {
         Ok(output) => match parse_deno_version(&output) {
             Some(version) => DependencyInfo {
@@ -408,7 +478,8 @@ mod tests {
     #[tokio::test]
     async fn version_command_reports_real_binary() {
         // The repo's own binary: exercises spawn + capture + timeout plumbing
-        // without depending on system software or the network.
+        // without depending on system software or the network. Pins the
+        // version SHAPE (date-style releases), never the exact release.
         let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
             .join("bin")
@@ -419,7 +490,18 @@ mod tests {
         let output = run_version_command(&binary, &["--version"], Duration::from_secs(30))
             .await
             .expect("bundled yt-dlp must answer --version");
-        assert_eq!(parse_ytdlp_version(&output), Some("2026.08.19".to_string()));
+        let version = parse_ytdlp_version(&output).expect("version should parse");
+        assert!(!version.trim().is_empty());
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(parts.len(), 3, "unexpected version shape: {}", version);
+        assert!(
+            parts
+                .iter()
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
+            "unexpected version shape: {}",
+            version
+        );
+        assert_eq!(parts[0].len(), 4, "year part expected: {}", version);
     }
 
     #[tokio::test]
@@ -453,5 +535,128 @@ mod tests {
             "unexpected message: {}",
             err
         );
+    }
+
+    fn fake_deno(dir: &Path) -> PathBuf {
+        let exe = dir.join("deno.exe");
+        std::fs::write(&exe, b"fake").expect("test file");
+        exe
+    }
+
+    #[test]
+    fn deno_resolution_prefers_path() {
+        // A: Deno in the first PATH dir wins, fallback untouched.
+        let path_dir = test_dir("ytdlp_gui_deno_a");
+        let fallback = test_dir("ytdlp_gui_deno_a_fb");
+        let exe = fake_deno(&path_dir);
+        let resolved = resolve_deno_in(std::slice::from_ref(&path_dir), Some(&fallback))
+            .expect("must resolve");
+        assert_eq!(resolved.path, exe);
+        assert_eq!(resolved.source, DenoSource::OnPath);
+        std::fs::remove_file(&exe).ok();
+        std::fs::remove_dir(&path_dir).ok();
+        std::fs::remove_dir(&fallback).ok();
+    }
+
+    #[test]
+    fn deno_resolution_uses_fallback() {
+        // B: missing from PATH dirs, present in fallback.
+        let path_dir = test_dir("ytdlp_gui_deno_b");
+        let fallback = test_dir("ytdlp_gui_deno_b_fb");
+        let exe = fake_deno(&fallback);
+        let resolved = resolve_deno_in(std::slice::from_ref(&path_dir), Some(&fallback))
+            .expect("must resolve");
+        assert_eq!(resolved.path, exe);
+        assert_eq!(resolved.source, DenoSource::UserFallback);
+        std::fs::remove_file(&exe).ok();
+        std::fs::remove_dir(&path_dir).ok();
+        std::fs::remove_dir(&fallback).ok();
+    }
+
+    #[test]
+    fn deno_resolution_path_beats_fallback() {
+        // C: present in both — PATH wins so no child adjustment is needed.
+        let path_dir = test_dir("ytdlp_gui_deno_c");
+        let fallback = test_dir("ytdlp_gui_deno_c_fb");
+        let path_exe = fake_deno(&path_dir);
+        let _fallback_exe = fake_deno(&fallback);
+        let resolved = resolve_deno_in(std::slice::from_ref(&path_dir), Some(&fallback))
+            .expect("must resolve");
+        assert_eq!(resolved.path, path_exe);
+        assert_eq!(resolved.source, DenoSource::OnPath);
+        std::fs::remove_file(&path_exe).ok();
+        std::fs::remove_file(fallback.join("deno.exe")).ok();
+        std::fs::remove_dir(&path_dir).ok();
+        std::fs::remove_dir(&fallback).ok();
+    }
+
+    #[test]
+    fn deno_resolution_none_when_absent() {
+        // D: nowhere — and no fallback configured.
+        let path_dir = test_dir("ytdlp_gui_deno_d");
+        assert_eq!(resolve_deno_in(std::slice::from_ref(&path_dir), None), None);
+        let fallback = test_dir("ytdlp_gui_deno_d_fb");
+        assert_eq!(
+            resolve_deno_in(std::slice::from_ref(&path_dir), Some(&fallback)),
+            None
+        );
+        std::fs::remove_dir(&path_dir).ok();
+        std::fs::remove_dir(&fallback).ok();
+    }
+
+    #[test]
+    fn deno_resolution_tolerates_spaces_and_unicode() {
+        // E: spaces/Unicode in the fallback path work.
+        let path_dir = test_dir("ytdlp_gui_deno_e");
+        let fallback = test_dir("ytdlp_gui_deno e 日本語 🎬");
+        let exe = fake_deno(&fallback);
+        let resolved = resolve_deno_in(std::slice::from_ref(&path_dir), Some(&fallback))
+            .expect("must resolve");
+        assert_eq!(resolved.path, exe);
+        assert_eq!(resolved.source, DenoSource::UserFallback);
+        std::fs::remove_file(&exe).ok();
+        std::fs::remove_dir(&path_dir).ok();
+        std::fs::remove_dir(&fallback).ok();
+    }
+
+    fn path_list(dirs: &[&str]) -> Option<std::ffi::OsString> {
+        let paths: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+        Some(std::env::join_paths(paths).expect("test paths join"))
+    }
+
+    fn split_list(value: &std::ffi::OsString) -> Vec<PathBuf> {
+        std::env::split_paths(value).collect()
+    }
+
+    #[test]
+    fn child_path_prepends_fallback_dir() {
+        // Existing A;B + fallback D → D;A;B.
+        let existing = path_list(&["C:\\A", "C:\\B"]);
+        let result = prepend_to_path_list(existing, Path::new("C:\\D")).expect("must build");
+        assert_eq!(
+            split_list(&result),
+            vec![
+                PathBuf::from("C:\\D"),
+                PathBuf::from("C:\\A"),
+                PathBuf::from("C:\\B"),
+            ]
+        );
+    }
+
+    #[test]
+    fn child_path_skips_duplicate_dir() {
+        // D already present → unchanged, not duplicated.
+        let existing = path_list(&["C:\\D", "C:\\A"]);
+        let result =
+            prepend_to_path_list(existing.clone(), Path::new("C:\\D")).expect("must build");
+        assert_eq!(split_list(&result), split_list(&existing.unwrap()));
+    }
+
+    #[test]
+    fn child_path_handles_missing_path_and_tricky_names() {
+        // No existing PATH → just the directory.
+        let dir = PathBuf::from("C:\\My Tools (x86) 日本語 🎬");
+        let result = prepend_to_path_list(None, &dir).expect("must build");
+        assert_eq!(split_list(&result), vec![dir]);
     }
 }

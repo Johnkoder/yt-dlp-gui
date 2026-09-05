@@ -148,7 +148,11 @@ yt-dlp-gui/
 - **Deno** (optional, not bundled): yt-dlp discovers a system Deno
   install via `PATH` and uses it as its JavaScript runtime for sites
   that need one. Without it yt-dlp prints a warning and some formats
-  may be missing. The app never bundles or manages Deno itself.
+  may be missing. The app never bundles or manages Deno itself. The app
+  detects Deno from `PATH` and from the standard `~/.deno/bin`
+  location; if Deno is found there but is not on `PATH`, the app makes
+  it available to the yt-dlp child process without modifying the user's
+  system `PATH`.
 
 The app detects all three at startup (Dependencies section + Refresh)
 but does NOT automatically install Deno or FFmpeg yet.

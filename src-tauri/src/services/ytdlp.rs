@@ -4,6 +4,7 @@
 //! pass, and how to interpret its stdout lives here. Tauri commands and the
 //! frontend must not duplicate any of this.
 
+use super::dependencies::{deno_child_path_dir, prepend_to_path_list};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -599,7 +600,16 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
     let final_path_file = final_path_sidecar();
     let args = build_download_args(&options, &final_path_file);
 
-    let mut child = match tokio::process::Command::new(&binary)
+    let mut command = tokio::process::Command::new(&binary);
+    // If Deno lives only at the user fallback (~/.deno/bin), the child
+    // would otherwise never see it: prepend that directory to the CHILD's
+    // PATH only. The system environment is never modified.
+    if let Some(deno_dir) = deno_child_path_dir() {
+        if let Ok(child_path) = prepend_to_path_list(std::env::var_os("PATH"), &deno_dir) {
+            command.env("PATH", child_path);
+        }
+    }
+    let mut child = match command
         .args(&args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
