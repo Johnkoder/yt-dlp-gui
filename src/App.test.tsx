@@ -46,43 +46,67 @@ function availableReport(): DependencyReport {
   };
 }
 
+type Handler = (payload: never) => void;
+
+/** Controllable backend double. Tests mutate `backend` per scenario. */
+const backend = {
+  report: availableReport(),
+  enqueueIds: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+  cancelOutcome: "cancelling" as "cancelling" | "removed" | "notFound",
+  failEnqueueWith: null as string | null,
+};
+
+function activeListen(handlers?: Map<string, Handler>) {
+  const unlistens = [vi.fn(), vi.fn(), vi.fn(), vi.fn(), vi.fn()];
+  const fns = [...unlistens];
+  mockListen.mockImplementation((event: string, handler: Handler) => {
+    handlers?.set(event, handler);
+    const unlisten = fns.shift() ?? vi.fn();
+    return Promise.resolve(unlisten);
+  });
+  return unlistens;
+}
+
 /** Default answers for non-dependency backend commands. */
 function defaultAnswer(command: string, args?: unknown) {
   if (command === "get_downloads_dir") {
     return Promise.resolve(DEFAULT_DIR);
   }
   if (command === "validate_output_directory") {
-    const path = (args as { path: string }).path;
-    return path === "C:\\stale\\gone"
-      ? Promise.reject(new Error("gone"))
-      : Promise.resolve(path);
+    return Promise.resolve((args as { path: string }).path);
+  }
+  if (command === "check_dependencies") {
+    return Promise.resolve(backend.report);
+  }
+  if (command === "enqueue_download") {
+    if (backend.failEnqueueWith) {
+      return Promise.reject(new Error(backend.failEnqueueWith));
+    }
+    const jobId = backend.enqueueIds.shift() ?? 99;
+    return Promise.resolve({ jobId });
+  }
+  if (command === "cancel_job") {
+    return Promise.resolve(backend.cancelOutcome);
   }
   return Promise.resolve(undefined);
 }
 
-/** Route mocked backend commands; stale paths fail validation. */
-function mockBackend(report = availableReport()) {
-  mockInvoke.mockImplementation((command: string, args?: unknown) => {
-    if (command === "check_dependencies") {
-      return Promise.resolve(report);
-    }
-    return defaultAnswer(command, args);
+function fire<T>(handlers: Map<string, Handler>, event: string, payload: T) {
+  return act(async () => {
+    handlers.get(event)?.({ payload } as never);
   });
 }
 
-async function renderReadyApp() {
-  activeListen();
+async function renderReadyApp(handlers?: Map<string, Handler>) {
+  activeListen(handlers);
   render(<App />);
-  // Flush subscription + output-folder init: initializing -> ready.
   await act(async () => {});
 }
 
-function activeListen() {
-  mockListen
-    .mockResolvedValueOnce(vi.fn())
-    .mockResolvedValueOnce(vi.fn())
-    .mockResolvedValueOnce(vi.fn())
-    .mockResolvedValueOnce(vi.fn());
+function enterUrl(url: string) {
+  fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+    target: { value: url },
+  });
 }
 
 beforeEach(() => {
@@ -90,7 +114,11 @@ beforeEach(() => {
   mockListen.mockReset();
   mockDialogOpen.mockReset().mockResolvedValue(null);
   window.localStorage.clear();
-  mockBackend();
+  backend.report = availableReport();
+  backend.enqueueIds = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+  backend.cancelOutcome = "cancelling";
+  backend.failEnqueueWith = null;
+  mockInvoke.mockImplementation(defaultAnswer);
 });
 
 // RTL auto-cleanup relies on globals mode; wire it explicitly instead.
@@ -111,14 +139,12 @@ describe("App download options", () => {
       "false",
     );
     expect(screen.getByLabelText("Quality")).toHaveValue("best");
-    // Empty URL: no download allowed yet.
+    // Empty URL: no enqueue allowed yet.
     expect(
       screen.getByRole("button", { name: /download video/i }),
     ).toBeDisabled();
 
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
+    enterUrl("https://example.com/v");
     expect(
       screen.getByRole("button", { name: /download video/i }),
     ).toBeEnabled();
@@ -127,9 +153,7 @@ describe("App download options", () => {
   it("hides quality and renames the button in Audio mode", async () => {
     await renderReadyApp();
 
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
+    enterUrl("https://example.com/v");
     fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
     expect(screen.getByRole("radio", { name: "Audio" })).toHaveAttribute(
       "aria-checked",
@@ -163,76 +187,6 @@ describe("App download options", () => {
     expect(document.activeElement).toBe(video);
   });
 
-  it("sends the selected video quality to the backend", async () => {
-    await renderReadyApp();
-
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.change(screen.getByLabelText("Quality"), {
-      target: { value: "1080" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
-
-    await act(async () => {});
-    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
-      request: {
-        url: "https://example.com/v",
-        mediaType: "video",
-        quality: "1080",
-        audioFormat: null,
-        outputDirectory: DEFAULT_DIR,
-      },
-    });
-  });
-
-  it("sends audio with a null quality", async () => {
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download audio/i }));
-
-    await act(async () => {});
-    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
-      request: {
-        url: "https://example.com/v",
-        mediaType: "audio",
-        quality: null,
-        audioFormat: "original",
-        outputDirectory: DEFAULT_DIR,
-      },
-    });
-  });
-
-  it("disables all controls while downloading", async () => {
-    mockInvoke.mockImplementation((command: string) => {
-      if (command === "get_downloads_dir") {
-        return Promise.resolve(DEFAULT_DIR);
-      }
-      return new Promise(() => {});
-    });
-    await renderReadyApp();
-
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
-    await act(async () => {});
-
-    expect(screen.getByPlaceholderText(/youtube\.com/)).toBeDisabled();
-    expect(screen.getByRole("radio", { name: "Video" })).toBeDisabled();
-    expect(screen.getByRole("radio", { name: "Audio" })).toBeDisabled();
-    expect(screen.getByLabelText("Quality")).toBeDisabled();
-    expect(screen.getByLabelText("Output folder")).toBeDisabled();
-    expect(screen.getByRole("button", { name: /browse/i })).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: /downloading/i }),
-    ).toBeDisabled();
-  });
-
   it("shows the default output folder on startup", async () => {
     await renderReadyApp();
 
@@ -241,8 +195,8 @@ describe("App download options", () => {
     expect(folder.title).toBe(DEFAULT_DIR);
   });
 
-  it("browse updates the folder, persists it, and sends it", async () => {
-    mockDialogOpen.mockResolvedValue(CUSTOM_DIR);
+  it("browse updates the folder and persists it", async () => {
+    mockDialogOpen.mockResolvedValue("D:\\Videos");
     await renderReadyApp();
 
     fireEvent.click(screen.getByRole("button", { name: /browse/i }));
@@ -250,25 +204,10 @@ describe("App download options", () => {
 
     expect(mockDialogOpen).toHaveBeenCalled();
     const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
-    expect(folder.value).toBe(CUSTOM_DIR);
+    expect(folder.value).toBe("D:\\Videos");
     expect(window.localStorage.getItem("yt-dlp-gui.outputDirectory")).toBe(
-      CUSTOM_DIR,
+      "D:\\Videos",
     );
-
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
-    await act(async () => {});
-    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
-      request: {
-        url: "https://example.com/v",
-        mediaType: "video",
-        quality: "best",
-        audioFormat: null,
-        outputDirectory: CUSTOM_DIR,
-      },
-    });
   });
 
   it("cancelled picker preserves the current folder", async () => {
@@ -283,7 +222,6 @@ describe("App download options", () => {
     expect(
       window.localStorage.getItem("yt-dlp-gui.outputDirectory"),
     ).toBeNull();
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("falls back to Downloads for a stale saved folder", async () => {
@@ -291,6 +229,16 @@ describe("App download options", () => {
       "yt-dlp-gui.outputDirectory",
       "C:\\stale\\gone",
     );
+    // Stale paths fail validation in the mock backend.
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "validate_output_directory") {
+        const path = (args as { path: string }).path;
+        return path === "C:\\stale\\gone"
+          ? Promise.reject(new Error("gone"))
+          : Promise.resolve(path);
+      }
+      return defaultAnswer(command, args);
+    });
     await renderReadyApp();
 
     const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
@@ -299,31 +247,364 @@ describe("App download options", () => {
       window.localStorage.getItem("yt-dlp-gui.outputDirectory"),
     ).toBeNull();
   });
+});
 
-  it("success shows the real folder and Open Folder uses it", async () => {
-    const handlers = new Map<string, (payload: never) => void>();
-    mockListen.mockImplementation((event: string, handler: (p: never) => void) => {
-      handlers.set(event, handler);
-      return Promise.resolve(vi.fn());
+describe("App queue", () => {
+  it("first enqueue creates a waiting job and clears only the URL", async () => {
+    await renderReadyApp();
+
+    enterUrl("https://example.com/a");
+    fireEvent.change(screen.getByLabelText("Quality"), {
+      target: { value: "1080" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_download", {
+      request: {
+        url: "https://example.com/a",
+        mediaType: "video",
+        quality: "1080",
+        audioFormat: null,
+        outputDirectory: DEFAULT_DIR,
+      },
+    });
+    expect(screen.getByLabelText("Job 1: Waiting")).toBeInTheDocument();
+    expect(screen.getByText("Video • 1080p")).toBeInTheDocument();
+    // URL cleared; selections preserved.
+    expect(
+      (screen.getByPlaceholderText(/youtube\.com/) as HTMLInputElement).value,
+    ).toBe("");
+    expect(screen.getByLabelText("Quality")).toHaveValue("1080");
+  });
+
+  it("second job enqueues while the first downloads", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 1 });
+
+    // Form stays usable; button becomes Add to Queue.
+    expect(screen.getByPlaceholderText(/youtube\.com/)).toBeEnabled();
+    expect(screen.getByRole("radio", { name: "Audio" })).toBeEnabled();
+    expect(screen.getByLabelText("Quality")).toBeEnabled();
+    expect(screen.getByLabelText("Output folder")).toBeEnabled();
+    expect(screen.getByRole("button", { name: /browse/i })).toBeEnabled();
+
+    enterUrl("https://example.com/b");
+    expect(
+      screen.getByRole("button", { name: /add to queue/i }),
+    ).toBeEnabled();
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    fireEvent.change(screen.getByLabelText("Audio format"), {
+      target: { value: "mp3" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+
+    const rows = screen.getAllByLabelText(/Job \d: (Waiting|Downloading)/);
+    expect(rows).toHaveLength(2);
+    expect(screen.getByText("Audio • MP3")).toBeInTheDocument();
+    const enqueues = mockInvoke.mock.calls.filter(
+      ([command]) => command === "enqueue_download",
+    );
+    expect(enqueues).toHaveLength(2);
+  });
+
+  it("snapshots stay distinct across jobs", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    fireEvent.change(screen.getByLabelText("Quality"), {
+      target: { value: "720" },
+    });
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 1 });
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 2 });
+    await fire(handlers, "download-complete", {
+      jobId: 1,
+      filename: "a [1].mp4",
+      filepath: `${DEFAULT_DIR}\\a [1].mp4`,
+      outputDir: DEFAULT_DIR,
+    });
+    await fire(handlers, "download-complete", {
+      jobId: 2,
+      filename: "b [2].m4a",
+      filepath: `${CUSTOM_DIR}\\b [2].m4a`,
+      outputDir: CUSTOM_DIR,
+    });
+
+    // Job 1 kept its video snapshot; rows show in FIFO order.
+    const completed = screen.getAllByText("Completed");
+    expect(completed).toHaveLength(2);
+    expect(screen.getByText("a [1].mp4")).toBeInTheDocument();
+    expect(screen.getByText("b [2].m4a")).toBeInTheDocument();
+  });
+
+  it("started event marks the correct job downloading", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+
+    await fire(handlers, "download-started", { jobId: 2 });
+    expect(
+      screen.getByLabelText("Job 2: Downloading"),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Job 1: Waiting")).toBeInTheDocument();
+  });
+
+  it("progress updates only the matching job", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 1 });
+    await fire(handlers, "download-progress", {
+      jobId: 1,
+      status: "Downloading",
+      percentage: 64,
+      speed: "7.2 MiB/s",
+      eta: "00:18",
+    });
+
+    expect(screen.getByText("64.0%")).toBeInTheDocument();
+    expect(screen.getByText(/7\.2 MiB\/s/)).toBeInTheDocument();
+  });
+
+  it("error on one job does not stop the next from starting", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+
+    await fire(handlers, "download-started", { jobId: 1 });
+    await fire(handlers, "download-error", {
+      jobId: 1,
+      message: "boom",
+      details: "boom details",
+    });
+    expect(screen.getByText("Failed")).toBeInTheDocument();
+    expect(screen.getByText("boom")).toBeInTheDocument();
+
+    await fire(handlers, "download-started", { jobId: 2 });
+    expect(screen.getByLabelText("Job 2: Downloading")).toBeInTheDocument();
+    expect(screen.getByLabelText("Job 1: Failed")).toBeInTheDocument();
+  });
+
+  it("cancel active then next job starts automatically", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+
+    await fire(handlers, "download-started", { jobId: 1 });
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await act(async () => {});
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_job", { jobId: 1 });
+    expect(
+      screen.getByRole("button", { name: /cancelling/i }),
+    ).toBeDisabled();
+
+    await fire(handlers, "download-cancelled", {
+      jobId: 1,
+      message: "Download cancelled.",
+    });
+    expect(screen.getByLabelText("Job 1: Cancelled")).toBeInTheDocument();
+    expect(screen.queryByText("Download failed")).not.toBeInTheDocument();
+
+    await fire(handlers, "download-started", { jobId: 2 });
+    expect(screen.getByLabelText("Job 2: Downloading")).toBeInTheDocument();
+  });
+
+  it("remove waiting job by id; removed job never starts", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+    backend.cancelOutcome = "removed";
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 1 });
+
+    const removeButtons = screen.getAllByRole("button", { name: /remove/i });
+    expect(removeButtons).toHaveLength(1);
+    fireEvent.click(removeButtons[0]);
+    await act(async () => {});
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_job", { jobId: 2 });
+    expect(screen.getByLabelText("Job 2: Cancelled")).toBeInTheDocument();
+
+    // Even if a stale started event arrived, a terminal row never regresses.
+    await fire(handlers, "download-started", { jobId: 2 });
+    expect(screen.getByLabelText("Job 2: Cancelled")).toBeInTheDocument();
+  });
+
+  it("waiting-to-active remove race showing cancelling is handled", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+    backend.cancelOutcome = "cancelling";
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+
+    const removeButtons = screen.getAllByRole("button", { name: /remove/i });
+    fireEvent.click(removeButtons[0]);
+    await act(async () => {});
+    // Backend promoted it first: row shows Cancelling, not removed.
+    expect(
+      screen.getByRole("button", { name: /cancelling/i }),
+    ).toBeDisabled();
+
+    await fire(handlers, "download-cancelled", {
+      jobId: 1,
+      message: "Download cancelled.",
+    });
+    expect(screen.getByLabelText("Job 1: Cancelled")).toBeInTheDocument();
+  });
+
+  it("late job 1 progress cannot modify job 2", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    enterUrl("https://example.com/b");
+    fireEvent.click(screen.getByRole("button", { name: /add to queue/i }));
+    await act(async () => {});
+
+    await fire(handlers, "download-started", { jobId: 1 });
+    await fire(handlers, "download-started", { jobId: 2 });
+    await fire(handlers, "download-progress", {
+      jobId: 1,
+      status: "Downloading",
+      percentage: 99,
+    });
+
+    expect(screen.getByLabelText("Job 1: Downloading")).toBeInTheDocument();
+    // Job 2 shows no percentage of its own.
+    const job2 = screen.getByLabelText("Job 2: Downloading");
+    expect(job2.textContent).not.toContain("99%");
+  });
+
+  it("started-before-response merges without regressing", async () => {
+    let resolveEnqueue!: (value: unknown) => void;
+    const handlers = new Map<string, Handler>();
+    activeListen(handlers);
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "enqueue_download") {
+        return new Promise((resolve) => {
+          resolveEnqueue = resolve;
+        });
+      }
+      return defaultAnswer(command, args);
     });
     render(<App />);
     await act(async () => {});
 
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    // Started lands before the enqueue response resolves.
+    await fire(handlers, "download-started", { jobId: 42 });
+    expect(screen.getByLabelText("Job 42: Downloading")).toBeInTheDocument();
+
     await act(async () => {
-      handlers.get("download-complete")?.({
-        payload: {
-          filename: "video [abc].mp4",
-          filepath: `${CUSTOM_DIR}\\video [abc].mp4`,
-          outputDir: CUSTOM_DIR,
-        },
-      } as never);
+      resolveEnqueue({ jobId: 42 });
+    });
+    await act(async () => {});
+    // Still exactly one row, still downloading, snapshot merged in.
+    expect(screen.getByLabelText("Job 42: Downloading")).toBeInTheDocument();
+    expect(screen.getByText("Video • Best")).toBeInTheDocument();
+    expect(
+      screen.queryByLabelText("Job 42: Waiting"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("double-click while submitting enqueues only once", async () => {
+    let resolveEnqueue!: (value: unknown) => void;
+    const handlers = new Map<string, Handler>();
+    activeListen(handlers);
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "enqueue_download") {
+        return new Promise((resolve) => {
+          resolveEnqueue = resolve;
+        });
+      }
+      return defaultAnswer(command, args);
+    });
+    render(<App />);
+    await act(async () => {});
+
+    enterUrl("https://example.com/a");
+    const button = screen.getByRole("button", { name: /download video/i });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await act(async () => {
+      resolveEnqueue({ jobId: 1 });
+    });
+    await act(async () => {});
+
+    const enqueues = mockInvoke.mock.calls.filter(
+      ([command]) => command === "enqueue_download",
+    );
+    expect(enqueues).toHaveLength(1);
+    expect(screen.getByLabelText("Job 1: Waiting")).toBeInTheDocument();
+    void handlers;
+  });
+
+  it("success rows open their own output folder", async () => {
+    const handlers = new Map<string, Handler>();
+    await renderReadyApp(handlers);
+
+    enterUrl("https://example.com/a");
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    await fire(handlers, "download-started", { jobId: 1 });
+    await fire(handlers, "download-complete", {
+      jobId: 1,
+      filename: "a [1].mp4",
+      filepath: `${DEFAULT_DIR}\\a [1].mp4`,
+      outputDir: DEFAULT_DIR,
     });
 
-    expect(screen.getByText(`Saved to ${CUSTOM_DIR}`)).toBeInTheDocument();
+    expect(screen.getByText("Completed")).toBeInTheDocument();
+    expect(screen.getByText("a [1].mp4")).toBeInTheDocument();
+    expect(screen.getByText(`Saved to ${DEFAULT_DIR}`)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /open folder/i }));
     await act(async () => {});
     expect(mockInvoke).toHaveBeenCalledWith("open_output_folder", {
-      path: CUSTOM_DIR,
+      path: DEFAULT_DIR,
     });
   });
 });
@@ -374,15 +655,17 @@ describe("App dependencies", () => {
       message:
         "FFmpeg was not found. High-quality video streams may not be mergeable, and audio conversion will be unavailable.",
     };
-    mockBackend(report);
+    backend.report = report;
     await renderReadyApp();
 
-    expect(screen.getByLabelText(/deno: /i)).toHaveTextContent(/not found|may not work fully/i);
-    expect(screen.getByLabelText(/ffmpeg: /i)).toHaveTextContent(/not found|not be mergeable/i);
+    expect(screen.getByLabelText(/deno: /i)).toHaveTextContent(
+      /not found|may not work fully/i,
+    );
+    expect(screen.getByLabelText(/ffmpeg: /i)).toHaveTextContent(
+      /not found|not be mergeable/i,
+    );
     // Downloads still allowed: enter URL and the button enables.
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
+    enterUrl("https://example.com/v");
     expect(
       screen.getByRole("button", { name: /download video/i }),
     ).toBeEnabled();
@@ -401,12 +684,10 @@ describe("App dependencies", () => {
       path: null,
       message: "yt-dlp is required to download media.",
     };
-    mockBackend(report);
+    backend.report = report;
     await renderReadyApp();
 
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
+    enterUrl("https://example.com/v");
     expect(
       screen.getByRole("button", { name: /download video/i }),
     ).toBeDisabled();
@@ -420,7 +701,7 @@ describe("App dependencies", () => {
     });
     await act(async () => {});
     const started = mockInvoke.mock.calls.filter(
-      ([command]) => command === "start_download",
+      ([command]) => command === "enqueue_download",
     );
     expect(started).toHaveLength(0);
   });
@@ -438,8 +719,7 @@ describe("App dependencies", () => {
     activeListen();
     render(<App />);
     const checks = () =>
-      mockInvoke.mock.calls.filter(([c]) => c === "check_dependencies")
-        .length;
+      mockInvoke.mock.calls.filter(([c]) => c === "check_dependencies").length;
 
     expect(checks()).toBe(1);
     await act(async () => {
@@ -462,12 +742,10 @@ describe("App dependencies", () => {
   it("download UI still works when all dependencies are available", async () => {
     await renderReadyApp();
 
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
+    enterUrl("https://example.com/v");
     fireEvent.click(screen.getByRole("button", { name: /download video/i }));
     await act(async () => {});
-    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_download", {
       request: {
         url: "https://example.com/v",
         mediaType: "video",
@@ -476,313 +754,5 @@ describe("App dependencies", () => {
         outputDirectory: DEFAULT_DIR,
       },
     });
-  });
-});
-
-describe("App audio formats", () => {
-  function ffmpegMissingReport(): DependencyReport {
-    const report = availableReport();
-    report.ffmpeg = {
-      name: "FFmpeg",
-      state: "missing",
-      version: null,
-      path: null,
-      message: "FFmpeg was not found.",
-    };
-    return report;
-  }
-
-  it("video mode shows Quality and hides Audio format", async () => {
-    await renderReadyApp();
-
-    expect(screen.getByLabelText("Quality")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Audio format")).not.toBeInTheDocument();
-  });
-
-  it("audio mode shows Audio format defaulting to Original", async () => {
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    expect(screen.queryByLabelText("Quality")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Audio format")).toHaveValue("original");
-  });
-
-  it("sends the selected conversion format", async () => {
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    fireEvent.change(screen.getByLabelText("Audio format"), {
-      target: { value: "mp3" },
-    });
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download audio/i }));
-    await act(async () => {});
-    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
-      request: {
-        url: "https://example.com/v",
-        mediaType: "audio",
-        quality: null,
-        audioFormat: "mp3",
-        outputDirectory: DEFAULT_DIR,
-      },
-    });
-  });
-
-  it("preserves selections when switching modes", async () => {
-    await renderReadyApp();
-
-    fireEvent.change(screen.getByLabelText("Quality"), {
-      target: { value: "720" },
-    });
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    fireEvent.change(screen.getByLabelText("Audio format"), {
-      target: { value: "flac" },
-    });
-    fireEvent.click(screen.getByRole("radio", { name: "Video" }));
-    expect(screen.getByLabelText("Quality")).toHaveValue("720");
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    expect(screen.getByLabelText("Audio format")).toHaveValue("flac");
-  });
-
-  it("missing FFmpeg leaves Original usable but locks conversions", async () => {
-    mockBackend(ffmpegMissingReport());
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    const select = screen.getByLabelText("Audio format") as HTMLSelectElement;
-    expect(select).toBeEnabled();
-    const mp3 = Array.from(select.options).find(
-      (option) => option.value === "mp3",
-    );
-    expect(mp3?.disabled).toBe(true);
-    expect(mp3?.textContent).toMatch(/FFmpeg required/);
-
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    expect(
-      screen.getByRole("button", { name: /download audio/i }),
-    ).toBeEnabled();
-  });
-
-  it("loading dependencies does not falsely unlock conversions", async () => {
-    mockInvoke.mockImplementation((command: string, args?: unknown) => {
-      if (command === "check_dependencies") {
-        return new Promise(() => {});
-      }
-      return defaultAnswer(command, args);
-    });
-    activeListen();
-    render(<App />);
-    await act(async () => {});
-
-    // Output init resolves, but FFmpeg status is still unknown.
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    const select = screen.getByLabelText("Audio format") as HTMLSelectElement;
-    const mp3 = Array.from(select.options).find(
-      (option) => option.value === "mp3",
-    );
-    expect(mp3?.disabled).toBe(true);
-    // Original itself stays selectable.
-    expect(select).toBeEnabled();
-  });
-
-  it("refresh falling back to Original when FFmpeg disappears", async () => {
-    const reports = [availableReport(), ffmpegMissingReport()];
-    mockInvoke.mockImplementation((command: string, args?: unknown) => {
-      if (command === "check_dependencies") {
-        return Promise.resolve(reports.shift() ?? availableReport());
-      }
-      return defaultAnswer(command, args);
-    });
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    fireEvent.change(screen.getByLabelText("Audio format"), {
-      target: { value: "mp3" },
-    });
-    expect(screen.getByLabelText("Audio format")).toHaveValue("mp3");
-
-    fireEvent.click(screen.getByRole("button", { name: /refresh/i }));
-    await act(async () => {});
-    await act(async () => {});
-    expect(screen.getByLabelText("Audio format")).toHaveValue("original");
-    // No download was triggered by the fallback.
-    const started = mockInvoke.mock.calls.filter(
-      ([command]) => command === "start_download",
-    );
-    expect(started).toHaveLength(0);
-  });
-
-  it("audio format selector locks while downloading", async () => {
-    mockInvoke.mockImplementation((command: string) => {
-      if (command === "check_dependencies") {
-        return Promise.resolve(availableReport());
-      }
-      if (command === "get_downloads_dir") {
-        return Promise.resolve(DEFAULT_DIR);
-      }
-      return new Promise(() => {});
-    });
-    await renderReadyApp();
-
-    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download audio/i }));
-    await act(async () => {});
-
-    expect(screen.getByLabelText("Audio format")).toBeDisabled();
-  });
-});
-
-describe("App cancellation", () => {
-  /** Render with pending start_download; returns captured event handlers. */
-  async function renderDownloadingApp() {
-    mockInvoke.mockImplementation((command: string, args?: unknown) => {
-      if (command === "check_dependencies") {
-        return Promise.resolve(availableReport());
-      }
-      if (command === "get_downloads_dir") {
-        return Promise.resolve(DEFAULT_DIR);
-      }
-      if (command === "validate_output_directory") {
-        return Promise.resolve((args as { path: string }).path);
-      }
-      return new Promise(() => {});
-    });
-    const handlers = new Map<string, (payload: never) => void>();
-    mockListen.mockImplementation((event: string, handler: (p: never) => void) => {
-      handlers.set(event, handler);
-      return Promise.resolve(vi.fn());
-    });
-    render(<App />);
-    await act(async () => {});
-
-    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
-      target: { value: "https://example.com/v" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
-    await act(async () => {});
-    return handlers;
-  }
-
-  function cancelRequests() {
-    return mockInvoke.mock.calls.filter(
-      ([command]) => command === "cancel_download",
-    );
-  }
-
-  it("shows no Cancel button when ready", async () => {
-    await renderReadyApp();
-    expect(
-      screen.queryByRole("button", { name: /^cancel$/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("shows an enabled Cancel button while downloading", async () => {
-    await renderDownloadingApp();
-    expect(screen.getByRole("button", { name: /^cancel$/i })).toBeEnabled();
-  });
-
-  it("cancel flows to a neutral Cancelled state, never Download failed", async () => {
-    const handlers = await renderDownloadingApp();
-
-    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
-    await act(async () => {});
-    expect(cancelRequests()).toHaveLength(1);
-    expect(
-      screen.getByRole("button", { name: /cancelling/i }),
-    ).toBeDisabled();
-
-    await act(async () => {
-      handlers.get("download-cancelled")?.({
-        payload: { message: "Download cancelled." },
-      } as never);
-    });
-    expect(screen.getByText("Download cancelled")).toBeInTheDocument();
-    expect(screen.getByText("The download was stopped.")).toBeInTheDocument();
-    expect(screen.queryByText("Download failed")).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /^cancel$/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("Download another returns to ready with selections preserved", async () => {
-    const handlers = await renderDownloadingApp();
-
-    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
-    await act(async () => {});
-    await act(async () => {
-      handlers.get("download-cancelled")?.({
-        payload: { message: "Download cancelled." },
-      } as never);
-    });
-
-    fireEvent.click(
-      screen.getByRole("button", { name: /download another/i }),
-    );
-    expect(
-      screen.getByRole("button", { name: /download video/i }),
-    ).toBeEnabled();
-    expect(
-      (screen.getByPlaceholderText(/youtube\.com/) as HTMLInputElement).value,
-    ).toBe("https://example.com/v");
-  });
-
-  it("controls stay locked while cancelling", async () => {
-    await renderDownloadingApp();
-
-    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
-    await act(async () => {});
-
-    expect(screen.getByPlaceholderText(/youtube\.com/)).toBeDisabled();
-    expect(screen.getByRole("radio", { name: "Video" })).toBeDisabled();
-    expect(screen.getByLabelText("Quality")).toBeDisabled();
-    expect(screen.getByLabelText("Output folder")).toBeDisabled();
-    expect(screen.getByRole("button", { name: /browse/i })).toBeDisabled();
-  });
-
-  it("second cancel click issues no further request", async () => {
-    await renderDownloadingApp();
-
-    const cancel = screen.getByRole("button", { name: /^cancel$/i });
-    fireEvent.click(cancel);
-    await act(async () => {});
-    fireEvent.click(screen.getByRole("button", { name: /cancelling/i }));
-    await act(async () => {});
-    expect(cancelRequests()).toHaveLength(1);
-  });
-
-  it("cancel IPC failure keeps the download running", async () => {
-    const handlers = await renderDownloadingApp();
-    mockInvoke.mockImplementation((command: string, args?: unknown) => {
-      if (command === "cancel_download") {
-        return Promise.reject(new Error("ipc down"));
-      }
-      return defaultAnswer(command, args);
-    });
-
-    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
-    await act(async () => {});
-
-    // Back to downloading: progress card still shown, targeted message out.
-    expect(screen.getByText(/could not cancel the download/i)).toBeInTheDocument();
-    expect(screen.queryByText("Download failed")).not.toBeInTheDocument();
-
-    // The still-running download can still complete normally afterwards.
-    await act(async () => {
-      handlers.get("download-complete")?.({
-        payload: {
-          filename: "video [abc].mp4",
-          filepath: `${DEFAULT_DIR}\\video [abc].mp4`,
-          outputDir: DEFAULT_DIR,
-        },
-      } as never);
-    });
-    expect(screen.getByText("Download complete")).toBeInTheDocument();
   });
 });

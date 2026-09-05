@@ -1,30 +1,43 @@
-/** Shared download-domain types for the MVP. */
+/** Shared download-domain types for the queue model. */
+
+import type { DownloadRequest } from "./options";
 
 /**
- * UI state machine. `initializing` lasts until all backend event listeners
- * are registered; downloads are only allowed from `ready` (or a completed
- * state with an active subscription). Cancellation is its own neutral
- * branch — never an error.
+ * Per-job lifecycle. Terminal states (success/error/cancelled) are sticky:
+ * late events for a terminal job are ignored.
  */
-export type DownloadStatus =
-  | "initializing"
-  | "ready"
+export type JobStatus =
+  | "queued"
   | "downloading"
   | "cancelling"
-  | "cancelled"
   | "success"
-  | "error";
+  | "error"
+  | "cancelled";
 
-/** Lifecycle of the backend event subscription (never a bare boolean). */
+/** Global app initialization (subscriptions + output folder). */
+export type InitStatus = "initializing" | "ready" | "error";
+
 export type EventSubscription = "pending" | "active" | "failed";
+
+export interface DownloadJob {
+  id: number;
+  /** Request snapshot; null only for a placeholder created by an early event. */
+  request: DownloadRequest | null;
+  status: JobStatus;
+  progress: DownloadProgressEvent | null;
+  result: DownloadResult | null;
+  errorMessage: string | null;
+  errorDetails: string | null;
+  cancelError: string | null;
+}
 
 /**
  * Structured progress payload emitted by the Rust backend over Tauri events.
  * Mirrors the `DownloadProgress` struct in `src-tauri/src/services/ytdlp.rs`.
- * All fields except `status` are optional: when yt-dlp output cannot be
- * parsed into a percentage, the UI falls back to the raw `status` text.
+ * `jobId` is authoritative — events are never attributed by "active" guess.
  */
 export interface DownloadProgressEvent {
+  jobId: number;
   /** Human-readable status line, e.g. "Downloading" or raw yt-dlp output. */
   status: string;
   /** 0-100 when parseable, otherwise undefined. */
@@ -37,7 +50,12 @@ export interface DownloadProgressEvent {
   filename?: string | null;
 }
 
+export interface DownloadStartedEvent {
+  jobId: number;
+}
+
 export interface DownloadResult {
+  jobId: number;
   /** Real final filename (after merge/post-processing). */
   filename?: string | null;
   /** Full final path, kept for future features (reveal in folder, …). */
@@ -47,11 +65,19 @@ export interface DownloadResult {
 }
 
 export interface DownloadError {
+  jobId: number;
   message: string;
   /** Truncated stderr tail for display. */
   details?: string | null;
 }
 
 export interface DownloadCancelled {
+  jobId: number;
   message: string;
+}
+
+export type CancelJobOutcome = "cancelling" | "removed" | "notFound";
+
+export interface EnqueueResult {
+  jobId: number;
 }

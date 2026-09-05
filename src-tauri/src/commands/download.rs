@@ -2,17 +2,25 @@
 //!
 //! The frontend invokes these commands and listens for progress events.
 //! Argument construction and process management live in
-//! `crate::services::ytdlp`; this module only validates input, guards
-//! the single active download, and spawns the background task.
+//! `crate::services::ytdlp`; this module owns the FIFO queue, the single
+//! active download, and the background worker.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{watch, Mutex};
 
 use crate::services::ytdlp::{self, StartDownloadRequest};
 
-/// The one active download, if any. The ID generation makes cleanup stale-
-/// safe: a finished old task can never clear a newer download's record.
+/// One waiting job: an ID plus the immutable request snapshot taken at
+/// enqueue time. Later form edits can never mutate it.
+struct QueuedDownload {
+    id: u64,
+    request: StartDownloadRequest,
+}
+
+/// The one active download, if any. The ID makes cleanup stale-safe: a
+/// finished old task can never clear a newer download's record.
 struct ActiveDownload {
     id: u64,
     cancel_tx: watch::Sender<bool>,
@@ -21,36 +29,90 @@ struct ActiveDownload {
 #[derive(Default)]
 struct DownloadControl {
     next_id: u64,
+    worker_running: bool,
     active: Option<ActiveDownload>,
+    queued: VecDeque<QueuedDownload>,
+}
+
+/// Outcome of asking to cancel/remove a job by ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CancelOutcome {
+    /// The job was active: cancellation was signalled; the terminal
+    /// `download-cancelled` event follows once the tree is reaped.
+    Cancelling,
+    /// The job was waiting: it was removed and its terminal
+    /// `download-cancelled` event was already emitted.
+    Removed,
+    /// No active or waiting job carries this ID.
+    NotFound,
+}
+
+/// Accepted-enqueue answer. The frontend sends semantic options only —
+/// never shell or process information.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueResult {
+    pub job_id: u64,
 }
 
 impl DownloadControl {
-    /// Register a new download. Returns its ID and the cancellation
-    /// receiver, or `None` when a download is already active. Registration
-    /// (check + install) happens atomically under one lock hold, so a
-    /// cancel arriving in any gap is never lost.
-    fn try_begin(&mut self) -> Option<(u64, watch::Receiver<bool>)> {
-        if self.active.is_some() {
-            return None;
-        }
+    /// Accept a validated request at the back of the FIFO queue. Returns the
+    /// fresh job ID and whether the caller must spawn the single queue
+    /// worker. Both decisions happen atomically under one lock hold, so
+    /// rapid enqueues still yield exactly one worker.
+    fn enqueue(&mut self, request: StartDownloadRequest) -> (u64, bool) {
         let id = self.next_id;
         self.next_id += 1;
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        self.active = Some(ActiveDownload { id, cancel_tx });
-        Some((id, cancel_rx))
+        self.queued.push_back(QueuedDownload { id, request });
+        let spawn_worker = !self.worker_running;
+        if spawn_worker {
+            self.worker_running = true;
+        }
+        (id, spawn_worker)
     }
 
-    /// Request cancellation of the active download, if any. Idempotent:
-    /// repeated calls just re-send an already-true flag. Returns whether a
-    /// download record existed.
-    fn cancel_active(&self) -> bool {
-        match &self.active {
-            Some(active) => {
-                let _ = active.cancel_tx.send(true);
-                true
+    /// Promote the front job to active, installing its cancellation channel.
+    /// When the queue is empty the worker parks itself (`worker_running` is
+    /// cleared) under the same lock, so an enqueue racing this transition
+    /// either hands its job to the live worker or starts a new one — a job
+    /// can never sit queued with no worker while the flag claims otherwise.
+    fn take_next(&mut self) -> Option<(u64, StartDownloadRequest, watch::Receiver<bool>)> {
+        match self.queued.pop_front() {
+            Some(job) => {
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                self.active = Some(ActiveDownload {
+                    id: job.id,
+                    cancel_tx,
+                });
+                Some((job.id, job.request, cancel_rx))
             }
-            None => false,
+            None => {
+                self.worker_running = false;
+                None
+            }
         }
+    }
+
+    /// Cancel or remove a job by ID, decided atomically: an active job gets
+    /// its cancellation signal; a waiting job is removed outright. The
+    /// waiting→active promotion race resolves here — whichever state the
+    /// lock observes is authoritative.
+    fn cancel_job(&mut self, id: u64) -> CancelOutcome {
+        if self.active.as_ref().is_some_and(|active| active.id == id) {
+            let _ = self
+                .active
+                .as_ref()
+                .expect("checked above")
+                .cancel_tx
+                .send(true);
+            return CancelOutcome::Cancelling;
+        }
+        if let Some(position) = self.queued.iter().position(|job| job.id == id) {
+            self.queued.remove(position);
+            return CancelOutcome::Removed;
+        }
+        CancelOutcome::NotFound
     }
 
     /// Clear the active record, but only if it still belongs to `id`.
@@ -61,16 +123,20 @@ impl DownloadControl {
         }
     }
 
-    /// Test-only visibility into the guard state.
     #[cfg(test)]
     fn is_active(&self) -> bool {
         self.active.is_some()
     }
+
+    #[cfg(test)]
+    fn queued_ids(&self) -> Vec<u64> {
+        self.queued.iter().map(|job| job.id).collect()
+    }
 }
 
-/// Single-download guard with cancellation support. Structured as managed
-/// state so a future queue can grow here without changing the command
-/// signatures' shape. No globals, no unsafe.
+/// FIFO queue with exactly one active download. Structured as managed state
+/// so the worker, commands, and (later) a queue UI share one authority.
+/// No globals, no unsafe.
 pub struct DownloadState {
     inner: Arc<Mutex<DownloadControl>>,
 }
@@ -88,16 +154,19 @@ fn is_valid_http_url(url: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() <= 2048
 }
 
-/// Start a download in the background. Takes a structured request (never a
-/// bag of flags); values are re-validated in Rust and never trusted blindly.
-/// Returns immediately; progress, completion, failure, and cancellation are
-/// delivered via Tauri events so the UI never blocks.
+/// Accept a download request into the FIFO queue. The request is fully
+/// validated up front (URL, media/quality/format combinations, output
+/// folder, yt-dlp resource, FFmpeg requirement) so obviously invalid jobs
+/// never enter the queue. Returns the backend-owned job ID.
+///
+/// At most one yt-dlp job runs at a time: the single queue worker picks the
+/// job up, or it is already running and will get to it in FIFO order.
 #[tauri::command]
-pub async fn start_download(
+pub async fn enqueue_download(
     app: AppHandle,
     state: State<'_, DownloadState>,
     request: StartDownloadRequest,
-) -> Result<(), String> {
+) -> Result<EnqueueResult, String> {
     if !is_valid_http_url(request.url.trim()) {
         return Err("That does not look like a valid http(s) URL.".to_string());
     }
@@ -105,41 +174,86 @@ pub async fn start_download(
     // understandable error instead of a silent background failure.
     ytdlp::resolve_ytdlp_path(&app)?;
 
-    // The output directory comes from the validated request — Downloads is
-    // only the default/fallback, never the forced destination.
-    let options = ytdlp::validate_request(&request)?;
+    // Full validation now (bad jobs never queue); the worker revalidates at
+    // execution time because folders and tools may change while waiting.
+    ytdlp::validate_request(&request)?;
 
-    // Register atomically: check + install under one lock so an immediate
-    // cancel can neither slip through nor hit a half-registered download.
-    let (id, cancel_rx) = {
+    let (job_id, spawn_worker) = {
         let mut control = state.inner.lock().await;
-        match control.try_begin() {
-            Some(registered) => registered,
-            None => return Err("A download is already running.".to_string()),
-        }
+        control.enqueue(request)
     };
 
-    let inner = state.inner.clone();
-    tokio::spawn(async move {
-        ytdlp::run_download(app.clone(), options, cancel_rx).await;
-        inner.lock().await.finish(id);
-    });
+    if spawn_worker {
+        let inner = state.inner.clone();
+        tokio::spawn(queue_worker(app, inner));
+    }
 
-    Ok(())
+    Ok(EnqueueResult { job_id })
 }
 
-/// Request cancellation of the active download, if any.
+/// Cancel or remove a queued job by its backend ID.
 ///
-/// Returns `true` when a cancellation request was sent to an active
-/// download, `false` when nothing was running. Idempotent and race-safe:
-/// repeated calls never panic, and calling with no active download is a
-/// harmless `false` — never a catastrophic error.
+/// - active job → cancellation is signalled; the terminal
+///   `download-cancelled` event follows once the process tree is reaped.
+/// - waiting job → removed immediately and its terminal `download-cancelled`
+///   event (`"Removed from queue."`) is emitted right here.
+/// - unknown ID → `NotFound`, harmless.
 ///
-/// The frontend only says "cancel the active download": no PIDs, paths, or
-/// process details ever cross IPC.
+/// The frontend supplies ONLY the job ID: no PIDs, paths, or process
+/// details ever cross IPC.
 #[tauri::command]
-pub async fn cancel_download(state: State<'_, DownloadState>) -> Result<bool, String> {
-    Ok(state.inner.lock().await.cancel_active())
+pub async fn cancel_job(
+    app: AppHandle,
+    state: State<'_, DownloadState>,
+    job_id: u64,
+) -> Result<CancelOutcome, String> {
+    let outcome = { state.inner.lock().await.cancel_job(job_id) };
+    if outcome == CancelOutcome::Removed {
+        let _ = app.emit(
+            ytdlp::CANCELLED_EVENT,
+            ytdlp::DownloadCancelled {
+                job_id,
+                message: "Removed from queue.".to_string(),
+            },
+        );
+    }
+    Ok(outcome)
+}
+
+/// The single queue worker. Sequential by construction: one task drains the
+/// FIFO, running each job to exactly one terminal outcome before taking the
+/// next. Errors, cancellations, and revalidation failures all continue the
+/// loop — one bad job never stalls the queue.
+async fn queue_worker(app: AppHandle, inner: Arc<Mutex<DownloadControl>>) {
+    loop {
+        let taken = { inner.lock().await.take_next() };
+        let Some((id, request, cancel_rx)) = taken else {
+            break;
+        };
+
+        let _ = app.emit(ytdlp::STARTED_EVENT, ytdlp::DownloadStarted { job_id: id });
+
+        // Revalidate at execution time: folders may vanish and tools may
+        // disappear while the job waits. A stale job errors WITHOUT
+        // launching yt-dlp, then the queue continues.
+        match ytdlp::validate_request(&request) {
+            Err(message) => {
+                let _ = app.emit(
+                    ytdlp::ERROR_EVENT,
+                    ytdlp::DownloadError {
+                        job_id: id,
+                        message: message.clone(),
+                        details: Some(message),
+                    },
+                );
+            }
+            Ok(options) => {
+                ytdlp::run_download(app.clone(), id, options, cancel_rx).await;
+            }
+        }
+
+        inner.lock().await.finish(id);
+    }
 }
 
 /// Absolute path of the user's Downloads folder (default output folder).
@@ -198,6 +312,17 @@ pub fn open_output_folder(path: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::ytdlp::{MediaType, VideoQuality};
+
+    fn video_request(url: &str) -> StartDownloadRequest {
+        StartDownloadRequest {
+            url: url.to_string(),
+            media_type: MediaType::Video,
+            quality: Some(VideoQuality::Best),
+            audio_format: None,
+            output_directory: None,
+        }
+    }
 
     #[test]
     fn accepts_http_urls() {
@@ -225,76 +350,170 @@ mod tests {
     }
 
     #[test]
-    fn control_registers_single_download() {
-        // A: no active download → registration succeeds.
+    fn enqueue_into_empty_queue_is_accepted() {
+        // A: first job gets ID 0 and requests the single worker.
         let mut control = DownloadControl::default();
-        let first = control.try_begin();
-        assert!(first.is_some());
+        let (id, spawn) = control.enqueue(video_request("https://a.example/"));
+        assert_eq!(id, 0);
+        assert!(spawn);
+        assert_eq!(control.queued_ids(), vec![0]);
+    }
+
+    #[test]
+    fn enqueue_keeps_fifo_order() {
+        // B: three jobs keep arrival order with unique increasing IDs.
+        let mut control = DownloadControl::default();
+        let (a, _) = control.enqueue(video_request("https://a.example/"));
+        let (b, _) = control.enqueue(video_request("https://b.example/"));
+        let (c, _) = control.enqueue(video_request("https://c.example/"));
+        assert!(a < b && b < c);
+        assert_eq!(control.queued_ids(), vec![a, b, c]);
+    }
+
+    #[test]
+    fn worker_take_and_finish_sequence() {
+        // D/E: the worker promotes the front job, finish clears it, and the
+        // next job follows — modelling success/error/cancel continuation.
+        let mut control = DownloadControl::default();
+        control.enqueue(video_request("https://a.example/"));
+        control.enqueue(video_request("https://b.example/"));
+
+        let (id_a, _, _) = control.take_next().expect("first job");
         assert!(control.is_active());
-        // B: second registration is rejected while active.
-        assert!(control.try_begin().is_none());
-    }
-
-    #[test]
-    fn control_cancel_signals_active_download() {
-        // C: cancel marks the receiver without needing async polling.
-        let mut control = DownloadControl::default();
-        let (_id, rx) = control.try_begin().expect("registered");
-        assert!(!*rx.borrow());
-        assert!(control.cancel_active());
-        assert!(*rx.borrow());
-        // D: repeat cancels are harmless and stay true.
-        assert!(control.cancel_active());
-        assert!(*rx.borrow());
-    }
-
-    #[test]
-    fn control_cancel_without_download_is_harmless() {
-        // E: nothing active → false, never a panic or error.
-        let control = DownloadControl::default();
+        // A second take while active still pops the queue (single-worker
+        // discipline belongs to the loop, which never overlaps takes).
+        control.finish(id_a);
         assert!(!control.is_active());
-        assert!(!control.cancel_active());
+        let (id_b, _, _) = control.take_next().expect("second job");
+        assert_ne!(id_a, id_b);
+        control.finish(id_b);
+        assert!(control.take_next().is_none());
     }
 
     #[test]
-    fn control_finish_honors_generation_id() {
-        // F: a stale task must never clear a newer download's record.
+    fn empty_queue_parks_worker() {
+        // F: draining the queue clears the running flag under the same lock.
+        let mut control = DownloadControl {
+            worker_running: true,
+            ..Default::default()
+        };
+        assert!(control.take_next().is_none());
+        assert!(!control.worker_running);
+    }
+
+    #[test]
+    fn remove_waiting_job_keeps_others() {
+        // G: only the requested waiting ID leaves.
         let mut control = DownloadControl::default();
-        let (first_id, _rx) = control.try_begin().expect("first");
+        let (a, _) = control.enqueue(video_request("https://a.example/"));
+        let (b, _) = control.enqueue(video_request("https://b.example/"));
+        let (c, _) = control.enqueue(video_request("https://c.example/"));
+        assert_eq!(control.cancel_job(999), CancelOutcome::NotFound);
+        assert_eq!(control.cancel_job(b), CancelOutcome::Removed);
+        assert_eq!(control.queued_ids(), vec![a, c]);
+    }
+
+    #[test]
+    fn cancel_active_signals_receiver() {
+        // H: active job resolves to Cancelling and flips the channel.
+        let mut control = DownloadControl::default();
+        control.enqueue(video_request("https://a.example/"));
+        let (id, _, rx) = control.take_next().expect("active");
+        assert!(!*rx.borrow());
+        assert_eq!(control.cancel_job(id), CancelOutcome::Cancelling);
+        assert!(*rx.borrow());
+        // Idempotent: asking again still reports Cancelling, never panics.
+        assert_eq!(control.cancel_job(id), CancelOutcome::Cancelling);
+    }
+
+    #[test]
+    fn waiting_to_active_race_resolves_authoritatively() {
+        // I: removal attempted as the job promotes resolves to whichever
+        // state the single lock observes — never a lost removal of a
+        // running job.
+        let mut control = DownloadControl::default();
+        let (id, _) = control.enqueue(video_request("https://a.example/"));
+        // Case 1: cancel lands first → Removed, worker later finds nothing.
+        assert_eq!(control.cancel_job(id), CancelOutcome::Removed);
+        assert!(control.take_next().is_none());
+        // Case 2: promotion lands first → Cancelling, never Removed.
+        let (id2, _) = control.enqueue(video_request("https://b.example/"));
+        let (active_id, _, _) = control.take_next().expect("promoted");
+        assert_eq!(id2, active_id);
+        assert_eq!(control.cancel_job(id2), CancelOutcome::Cancelling);
+    }
+
+    #[test]
+    fn stale_finish_cannot_clear_newer_download() {
+        // J: generation IDs protect the active record.
+        let mut control = DownloadControl::default();
+        let (first, _) = control.enqueue(video_request("https://a.example/"));
+        let (first_id, _, _) = control.take_next().expect("active");
+        assert_eq!(first, first_id);
         control.finish(first_id + 999);
         assert!(control.is_active(), "wrong id must not clear");
         control.finish(first_id);
-        assert!(!control.is_active(), "matching id clears");
-
-        // A newer download after cleanup gets a fresh record the old
-        // task cannot disturb.
-        let (second_id, _) = control.try_begin().expect("second");
-        assert_ne!(first_id, second_id);
-        control.finish(first_id);
+        assert!(!control.is_active());
+        let (second, _) = control.enqueue(video_request("https://b.example/"));
+        let _ = control.take_next().expect("second active");
+        assert_ne!(first, second);
+        control.finish(first);
         assert!(control.is_active(), "stale finish must not clear");
     }
 
+    #[test]
+    fn cancel_outcome_serializes_camel_case() {
+        assert_eq!(
+            serde_json::to_value(CancelOutcome::Cancelling).expect("serializes"),
+            serde_json::json!("cancelling")
+        );
+        assert_eq!(
+            serde_json::to_value(CancelOutcome::Removed).expect("serializes"),
+            serde_json::json!("removed")
+        );
+        assert_eq!(
+            serde_json::to_value(CancelOutcome::NotFound).expect("serializes"),
+            serde_json::json!("notFound")
+        );
+        assert_eq!(
+            serde_json::to_value(EnqueueResult { job_id: 17 }).expect("serializes"),
+            serde_json::json!({ "jobId": 17 })
+        );
+    }
+
     #[tokio::test]
-    async fn control_flow_across_tasks() {
-        // Registration, async cancellation, and guarded finish cooperate.
+    async fn concurrent_enqueues_keep_fifo_and_single_worker() {
+        // Many simultaneous enqueues: unique IDs, no lost jobs, exactly one
+        // worker-spawn request, dequeue order matching ID order.
         let state = DownloadState::default();
-        let (id, mut rx) = {
-            let mut control = state.inner.lock().await;
-            control.try_begin().expect("registered")
-        };
-        assert!(state.inner.lock().await.cancel_active());
-        assert!(*rx.borrow());
-        // Receiver observes the signal without polling.
-        rx.wait_for(|cancelled| *cancelled)
-            .await
-            .expect("signal arrives");
-        {
-            let mut control = state.inner.lock().await;
-            control.finish(id + 1);
-            assert!(control.is_active());
-            control.finish(id);
-            assert!(!control.is_active());
+        let mut handles = Vec::new();
+        for i in 0..16u64 {
+            let inner = state.inner.clone();
+            handles.push(tokio::spawn(async move {
+                let mut control = inner.lock().await;
+                control.enqueue(video_request(&format!("https://{}.example/", i)))
+            }));
         }
-        assert!(!state.inner.lock().await.cancel_active());
+        let mut outcomes = Vec::new();
+        for handle in handles {
+            outcomes.push(handle.await.expect("enqueue task"));
+        }
+        let mut ids: Vec<u64> = outcomes.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 16, "IDs must be unique, none lost");
+        let spawns = outcomes.iter().filter(|(_, spawn)| *spawn).count();
+        assert_eq!(spawns, 1, "exactly one worker-spawn request");
+        // FIFO: locked-order pushes dequeue in ID order.
+        let mut control = state.inner.lock().await;
+        let mut dequeued = Vec::new();
+        while let Some((id, _, _)) = control.take_next() {
+            dequeued.push(id);
+            control.finish(id);
+        }
+        let mut sorted = dequeued.clone();
+        sorted.sort_unstable();
+        assert_eq!(dequeued, sorted, "dequeue follows ID order");
+        assert!(!control.worker_running);
     }
 }

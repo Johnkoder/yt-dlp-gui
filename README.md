@@ -3,7 +3,8 @@
 A Windows desktop app that downloads videos and audio without the
 command line.
 Paste a URL, press **Download**, watch real progress, and find the
-file in your Downloads folder.
+file in your Downloads folder. Multiple downloads queue up and run one
+at a time.
 
 **yt-dlp** does the actual downloading — this app is a native GUI around
 the `yt-dlp.exe` binary, which is bundled as an application resource.
@@ -31,8 +32,12 @@ tool yt-dlp uses for merging separate streams and future conversion.
   (`%(title)s [%(id)s].%(ext)s` naming)
 - High-quality video may need FFmpeg to merge separate streams; a missing
   FFmpeg produces an understandable error, never a fake file
-- Clear success state with an **Open Folder** button that opens the
-  actual folder the download went to
+- Clear per-job states with an **Open Folder** button that opens the
+  actual folder each download went to
+- FIFO download queue: enqueue while one runs (the form stays usable),
+  one active yt-dlp job at a time, waiting jobs removable, automatic
+  continuation after success/error/cancellation. Session-only, not
+  persisted
 - Active downloads can be cancelled: the yt-dlp job (including any
   FFmpeg child on Windows) is terminated and cancellation is reported
   as its own neutral state, not an error. Cancelling may leave a
@@ -42,7 +47,8 @@ tool yt-dlp uses for merging separate streams and future conversion.
 - Understandable errors (bad URL, unavailable/private video, unavailable
   quality, missing FFmpeg, HTTP and network failures, missing yt-dlp
   binary, missing Deno) with stderr details in the UI
-- Single-download guard so concurrent downloads can't collide
+- FIFO queue owns ordering with exactly one active yt-dlp job, so
+  concurrent downloads can't collide
 
 ## Tech stack
 
@@ -59,15 +65,15 @@ execution happens in Rust.
 ## Architecture overview
 
 ```text
-React UI
-  │  invoke("start_download") / listen("download-*")
+React UI (draft form + queue rows)
+  │  invoke("enqueue_download" / "cancel_job") / listen("download-*")
   ▼
 Tauri commands  (src-tauri/src/commands/download.rs)
-  │  validate, guard, spawn background task
+  │  validate, FIFO queue, single worker, cancel/remove by job ID
   ▼
 yt-dlp service  (src-tauri/src/services/ytdlp.rs)
   │  resolve binary, build argv, spawn process,
-  │  parse stdout, emit structured events
+  │  parse stdout, emit job-tagged events
   ▼
 yt-dlp.exe  (direct execution, one argv element per argument)
 ```
@@ -96,16 +102,16 @@ yt-dlp.exe  (direct execution, one argv element per argument)
 yt-dlp-gui/
 ├── src/
 │   ├── components/            # UrlInput, DownloadButton,
-│   │                          # DownloadProgress, StatusMessage,
+│   │                          # DownloadProgress, CancelButton,
 │   │                          # MediaTypeSelector, QualitySelector,
-│   │                          # AudioFormatSelector, CancelButton,
+│   │                          # AudioFormatSelector, QueueSection,
 │   │                          # OutputFolderSelector, DependencySection
 │   ├── features/downloads/
-│   │   ├── hooks/useDownload.ts   # initializing|ready|…|cancelled machine
+│   │   ├── hooks/useDownloadQueue.ts  # FIFO jobs + init + draft form
 │   │   ├── downloadService.ts     # Tauri invoke/listen/dialog wrapper + errors
 │   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
 │   │   ├── outputDirectory.ts     # output-folder preference persistence
-│   │   └── types.ts
+│   │   └── types.ts               # JobStatus, DownloadJob, job events
 │   ├── features/dependencies/
 │   │   ├── hooks/useDependencies.ts  # idle|loading|ready|error checks
 │   │   ├── dependencyService.ts      # check_dependencies wrapper
@@ -116,7 +122,8 @@ yt-dlp-gui/
 ├── src-tauri/
 │   ├── src/
 │   │   ├── commands/
-│   │   │   ├── download.rs        # start/cancel_download, dirs, open_output_folder
+│   │   │   ├── download.rs        # enqueue/cancel_job, FIFO worker, dirs,
+│   │   │   │                      # open_output_folder
 │   │   │   └── dependencies.rs    # check_dependencies
 │   │   ├── services/
 │   │   │   ├── ytdlp.rs           # binary resolver, argv builder,
@@ -230,11 +237,13 @@ Completed:
 - dependency detection (bundled yt-dlp, system Deno, system FFmpeg)
 - audio format conversion (Original/MP3/M4A/WAV/FLAC via FFmpeg)
 - cancellation (terminates the yt-dlp job tree, neutral Cancelled state)
+- sequential download queue (FIFO, one active job, remove/cancel,
+  auto-continue, session-only)
 
 Possible next:
-- download queue
 - playlist support
 - history
+- dependency setup assistance
 etc.
 
 ## License

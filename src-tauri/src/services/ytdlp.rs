@@ -21,6 +21,7 @@ pub const PROGRESS_EVENT: &str = "download-progress";
 pub const COMPLETE_EVENT: &str = "download-complete";
 pub const ERROR_EVENT: &str = "download-error";
 pub const CANCELLED_EVENT: &str = "download-cancelled";
+pub const STARTED_EVENT: &str = "download-started";
 
 const BINARY_FILE_NAME: &str = "yt-dlp.exe";
 
@@ -256,10 +257,12 @@ pub fn validate_request_with(
 /// Structured progress payload sent to the frontend over Tauri events.
 /// Percentage/speed/eta/filename are optional: when yt-dlp output cannot
 /// be parsed, the UI falls back to the raw `status` text instead of
-/// inventing progress.
+/// inventing progress. Every event carries its job ID — the frontend must
+/// never infer ownership from "currently active".
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadProgress {
+    pub job_id: u64,
     pub status: String,
     pub percentage: Option<f32>,
     pub speed: Option<String>,
@@ -269,7 +272,14 @@ pub struct DownloadProgress {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DownloadStarted {
+    pub job_id: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DownloadResult {
+    pub job_id: u64,
     /// Display name of the real final file (after merge/post-processing).
     pub filename: Option<String>,
     /// Full final path, kept for future features (reveal in folder, …).
@@ -281,6 +291,7 @@ pub struct DownloadResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadError {
+    pub job_id: u64,
     pub message: String,
     pub details: Option<String>,
 }
@@ -290,6 +301,7 @@ pub struct DownloadError {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DownloadCancelled {
+    pub job_id: u64,
     pub message: String,
 }
 
@@ -537,8 +549,10 @@ fn file_name_from_path(path: &str) -> String {
 
 /// Interpret one stdout line from yt-dlp. Updates `current_filename` when a
 /// destination becomes known. Returns a progress payload when the line
-/// carries user-visible status, or `None` for noise.
+/// carries user-visible status, or `None` for noise. The owning job ID is
+/// stamped here so events can never be attributed to the wrong job.
 pub fn parse_progress_line(
+    job_id: u64,
     line: &str,
     current_filename: &mut Option<String>,
 ) -> Option<DownloadProgress> {
@@ -551,6 +565,7 @@ pub fn parse_progress_line(
         let name = file_name_from_path(&caps["path"]);
         *current_filename = Some(name.clone());
         return Some(DownloadProgress {
+            job_id,
             status: "Downloading".to_string(),
             percentage: None,
             speed: None,
@@ -563,6 +578,7 @@ pub fn parse_progress_line(
         let name = file_name_from_path(&caps["path"]);
         *current_filename = Some(name.clone());
         return Some(DownloadProgress {
+            job_id,
             status: "Already downloaded".to_string(),
             percentage: Some(100.0),
             speed: None,
@@ -576,6 +592,7 @@ pub fn parse_progress_line(
         let speed = caps.name("speed").map(|m| m.as_str().to_string());
         let eta = caps.name("eta").map(|m| m.as_str().to_string());
         return Some(DownloadProgress {
+            job_id,
             status: "Downloading".to_string(),
             percentage,
             speed,
@@ -592,6 +609,7 @@ pub fn parse_progress_line(
             format!("Processing: {}", rest)
         };
         return Some(DownloadProgress {
+            job_id,
             status,
             percentage: None,
             speed: None,
@@ -606,6 +624,7 @@ pub fn parse_progress_line(
         || trimmed.starts_with("[youtube]")
     {
         return Some(DownloadProgress {
+            job_id,
             status: trimmed.to_string(),
             percentage: None,
             speed: None,
@@ -675,10 +694,11 @@ fn emit_error(app: &AppHandle, error: &DownloadError) {
     let _ = app.emit(ERROR_EVENT, error);
 }
 
-fn emit_cancelled(app: &AppHandle) {
+fn emit_cancelled(app: &AppHandle, job_id: u64) {
     let _ = app.emit(
         CANCELLED_EVENT,
         DownloadCancelled {
+            job_id,
             message: "Download cancelled.".to_string(),
         },
     );
@@ -750,10 +770,12 @@ async fn terminate_child_tree(child: &mut tokio::process::Child, pid: Option<u32
 }
 
 /// Run one download to completion, streaming progress events.
-/// Intended to be spawned as a background task by the command layer.
-/// Emits exactly one terminal event per run: complete, error, OR cancelled.
+/// Intended to be run by the single queue worker (or spawned directly in
+/// tests of the past). Emits exactly one terminal event per run: complete,
+/// error, OR cancelled — always tagged with this job's ID.
 pub async fn run_download(
     app: AppHandle,
+    job_id: u64,
     options: DownloadOptions,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
@@ -763,6 +785,7 @@ pub async fn run_download(
             emit_error(
                 &app,
                 &DownloadError {
+                    job_id,
                     message: message.clone(),
                     details: Some(message),
                 },
@@ -779,7 +802,7 @@ pub async fn run_download(
     // is honored by never launching at all. (If it arrives a moment later,
     // the select below terminates the fresh child at once instead.)
     if *cancel_rx.borrow() {
-        emit_cancelled(&app);
+        emit_cancelled(&app, job_id);
         return;
     }
 
@@ -807,6 +830,7 @@ pub async fn run_download(
             emit_error(
                 &app,
                 &DownloadError {
+                    job_id,
                     message: message.clone(),
                     details: Some(message),
                 },
@@ -826,6 +850,7 @@ pub async fn run_download(
             emit_error(
                 &app,
                 &DownloadError {
+                    job_id,
                     message: message.clone(),
                     details: Some(message),
                 },
@@ -839,6 +864,7 @@ pub async fn run_download(
     emit_progress(
         &app,
         &DownloadProgress {
+            job_id,
             status: "Starting download…".to_string(),
             percentage: None,
             speed: None,
@@ -854,7 +880,7 @@ pub async fn run_download(
         let mut current_filename: Option<String> = None;
         let mut destination_filename: Option<String> = None;
         while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(progress) = parse_progress_line(&line, &mut current_filename) {
+            if let Some(progress) = parse_progress_line(job_id, &line, &mut current_filename) {
                 if progress.filename.is_some() {
                     destination_filename = progress.filename.clone();
                 }
@@ -908,6 +934,7 @@ pub async fn run_download(
                         Ok((filename, filepath)) => emit_complete(
                             &app,
                             &DownloadResult {
+                                job_id,
                                 filename,
                                 filepath,
                                 output_dir: output_dir.to_string_lossy().to_string(),
@@ -922,6 +949,7 @@ pub async fn run_download(
                             emit_error(
                                 &app,
                                 &DownloadError {
+                                    job_id,
                                     message,
                                     details: Some(details),
                                 },
@@ -938,6 +966,7 @@ pub async fn run_download(
                     emit_error(
                         &app,
                         &DownloadError {
+                            job_id,
                             message: first_meaningful_line(&stderr_text)
                                 .unwrap_or_else(|| format!("yt-dlp exited with status {}", exit)),
                             details: Some(details),
@@ -949,6 +978,7 @@ pub async fn run_download(
                     emit_error(
                         &app,
                         &DownloadError {
+                            job_id,
                             message: message.clone(),
                             details: Some(if stderr_text.trim().is_empty() {
                                 message
@@ -969,7 +999,7 @@ pub async fn run_download(
             let _ = stdout_task.await;
             let _ = stderr_task.await;
             let _ = std::fs::remove_file(&final_path_file);
-            emit_cancelled(&app);
+            emit_cancelled(&app, job_id);
         }
     }
 }
@@ -1019,10 +1049,12 @@ mod tests {
     fn parses_percentage_line() {
         let mut filename = Some("video.mp4".to_string());
         let parsed = parse_progress_line(
+            7,
             "[download]  37.4% of 105.20MiB at 8.40MiB/s ETA 00:08",
             &mut filename,
         )
         .expect("should parse");
+        assert_eq!(parsed.job_id, 7);
         assert!((parsed.percentage.unwrap() - 37.4).abs() < 0.01);
         assert_eq!(parsed.speed.as_deref(), Some("8.40MiB/s"));
         assert_eq!(parsed.eta.as_deref(), Some("00:08"));
@@ -1036,10 +1068,12 @@ mod tests {
         // empty rather than failing.
         let mut filename = None;
         let parsed = parse_progress_line(
+            7,
             "[download]   1.3% of ~  52.84KiB at      0.00B/s ETA Unknown (frag 1/38)",
             &mut filename,
         )
         .expect("should parse");
+        assert_eq!(parsed.job_id, 7);
         assert!((parsed.percentage.unwrap() - 1.3).abs() < 0.01);
         assert_eq!(parsed.speed, None);
         assert_eq!(parsed.eta, None);
@@ -1050,10 +1084,12 @@ mod tests {
     fn parses_destination_line() {
         let mut filename = None;
         let parsed = parse_progress_line(
+            7,
             r"[download] Destination: C:\Users\Alex\Downloads\My Video [abc123].mp4",
             &mut filename,
         )
         .expect("should parse");
+        assert_eq!(parsed.job_id, 7);
         assert_eq!(parsed.filename.as_deref(), Some("My Video [abc123].mp4"));
         assert_eq!(filename.as_deref(), Some("My Video [abc123].mp4"));
     }
@@ -1614,11 +1650,8 @@ mod tests {
         // No signal: the waiter stays pending (proves it does not invent
         // cancellation). Bounded by timeout so the suite cannot hang.
         let (_tx, mut rx) = watch::channel(false);
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(200),
-            wait_for_cancel(&mut rx),
-        )
-        .await;
+        let outcome =
+            tokio::time::timeout(Duration::from_millis(200), wait_for_cancel(&mut rx)).await;
         assert!(outcome.is_err(), "must still be pending without a signal");
     }
 
@@ -1690,7 +1723,7 @@ mod tests {
             "[download] Destination: video [abc123].f140.m4a",
             "[Merger] Merging formats into \"video [abc123].mp4\"",
         ] {
-            let _ = parse_progress_line(line, &mut current);
+            let _ = parse_progress_line(3, line, &mut current);
         }
         assert_eq!(current.as_deref(), Some("video [abc123].f140.m4a"));
 
@@ -1705,6 +1738,55 @@ mod tests {
             Some(final_path.to_string_lossy().as_ref())
         );
         std::fs::remove_file(&final_path).ok();
+    }
+
+    #[test]
+    fn event_payloads_serialize_job_id() {
+        // Every event must expose `jobId` (camelCase) — never `job_id` —
+        // so the frontend can attribute events without guessing.
+        let progress = DownloadProgress {
+            job_id: 42,
+            status: "Downloading".to_string(),
+            percentage: Some(50.0),
+            speed: None,
+            eta: None,
+            filename: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&progress).expect("serializes")["jobId"],
+            42
+        );
+        let started = DownloadStarted { job_id: 42 };
+        assert_eq!(
+            serde_json::to_value(&started).expect("serializes")["jobId"],
+            42
+        );
+        let result = DownloadResult {
+            job_id: 42,
+            filename: None,
+            filepath: None,
+            output_dir: "C:\\dl".to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(&result).expect("serializes")["jobId"],
+            42
+        );
+        let error = DownloadError {
+            job_id: 42,
+            message: "x".to_string(),
+            details: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&error).expect("serializes")["jobId"],
+            42
+        );
+        let cancelled = DownloadCancelled {
+            job_id: 42,
+            message: "Download cancelled.".to_string(),
+        };
+        let value = serde_json::to_value(&cancelled).expect("serializes");
+        assert_eq!(value["jobId"], 42);
+        assert_eq!(value["message"], "Download cancelled.");
     }
 
     #[test]

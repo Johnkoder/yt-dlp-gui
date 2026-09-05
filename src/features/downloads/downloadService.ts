@@ -3,18 +3,23 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { DownloadRequest, MediaType } from "./options";
 import type {
+  CancelJobOutcome,
   DownloadCancelled,
   DownloadError,
   DownloadProgressEvent,
   DownloadResult,
+  DownloadStartedEvent,
+  EnqueueResult,
 } from "./types";
 
+export const DOWNLOAD_STARTED_EVENT = "download-started";
 export const DOWNLOAD_PROGRESS_EVENT = "download-progress";
 export const DOWNLOAD_COMPLETE_EVENT = "download-complete";
 export const DOWNLOAD_ERROR_EVENT = "download-error";
 export const DOWNLOAD_CANCELLED_EVENT = "download-cancelled";
 
 export interface DownloadEventHandlers {
+  onStarted: (event: DownloadStartedEvent) => void;
   onProgress: (progress: DownloadProgressEvent) => void;
   onComplete: (result: DownloadResult) => void;
   onError: (error: DownloadError) => void;
@@ -24,20 +29,12 @@ export interface DownloadEventHandlers {
 /**
  * Thin wrapper over Tauri commands/events for downloads.
  *
- * The React layer sends semantic options (media type, quality preset) and
- * never builds shell strings or yt-dlp arguments. All argument
- * construction and process execution lives in the Rust backend
- * (`src-tauri/src/services/ytdlp.rs`).
+ * The React layer sends semantic option snapshots (media type, quality
+ * preset, folder) and never builds shell strings or yt-dlp arguments. All
+ * argument construction and process execution lives in the Rust backend
+ * (`src-tauri/src/services/ytdlp.rs`), which also owns queue order and the
+ * single active job.
  */
-export async function startDownload(request: DownloadRequest): Promise<void> {
-  const url = request.url.trim();
-  if (url.length === 0) {
-    throw new Error("Please paste a video URL first.");
-  }
-  await invoke("start_download", {
-    request: { ...request, url },
-  });
-}
 
 export async function openOutputFolder(path: string): Promise<void> {
   await invoke("open_output_folder", { path });
@@ -162,12 +159,30 @@ export function friendlyErrorMessage(
 }
 
 /**
- * Request cancellation of the active download. Returns true when a
- * cancellation request reached an active download, false when nothing was
- * running. No PIDs or process details cross IPC — the backend owns them.
+ * Request cancellation or removal of one queued job by backend ID.
+ * Returns what the backend did: signalled an active job ("cancelling"),
+ * removed a waiting job ("removed"), or found nothing ("notFound").
+ * No PIDs or process details cross IPC — the backend owns them.
  */
-export async function cancelDownload(): Promise<boolean> {
-  return invoke<boolean>("cancel_download");
+export async function cancelJob(jobId: number): Promise<CancelJobOutcome> {
+  return invoke<CancelJobOutcome>("cancel_job", { jobId });
+}
+
+/**
+ * Enqueue a download request snapshot. Returns the backend-owned job ID.
+ * The worker starts the job immediately when idle, otherwise it waits its
+ * FIFO turn; progress arrives via events either way.
+ */
+export async function enqueueDownload(
+  request: DownloadRequest,
+): Promise<EnqueueResult> {
+  const url = request.url.trim();
+  if (url.length === 0) {
+    throw new Error("Please paste a video URL first.");
+  }
+  return invoke<EnqueueResult>("enqueue_download", {
+    request: { ...request, url },
+  });
 }
 
 /**
@@ -183,6 +198,12 @@ export async function subscribeToDownloadEvents(
 ): Promise<UnlistenFn> {
   const unlisteners: UnlistenFn[] = [];
   try {
+    unlisteners.push(
+      await listen<DownloadStartedEvent>(
+        DOWNLOAD_STARTED_EVENT,
+        (event) => handlers.onStarted(event.payload),
+      ),
+    );
     unlisteners.push(
       await listen<DownloadProgressEvent>(
         DOWNLOAD_PROGRESS_EVENT,

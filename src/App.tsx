@@ -1,23 +1,20 @@
 import { useEffect } from "react";
 import { AudioFormatSelector } from "./components/AudioFormatSelector";
-import { CancelButton } from "./components/CancelButton";
 import { DependencySection } from "./components/DependencySection";
 import { DownloadButton } from "./components/DownloadButton";
-import { DownloadProgress } from "./components/DownloadProgress";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
 import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
-import { StatusMessage } from "./components/StatusMessage";
+import { QueueSection } from "./components/QueueSection";
 import { UrlInput } from "./components/UrlInput";
 import { AUDIO_FORMAT_LABELS } from "./features/downloads/options";
 import { useDependencies } from "./features/dependencies/hooks/useDependencies";
-import { useDownload } from "./features/downloads/hooks/useDownload";
+import { useDownloadQueue } from "./features/downloads/hooks/useDownloadQueue";
 import "./App.css";
 
 export default function App() {
   const {
-    status,
-    subscription,
+    initStatus,
     url,
     setUrl,
     mediaType,
@@ -28,38 +25,36 @@ export default function App() {
     setAudioFormat,
     outputDirectory,
     chooseOutputDirectory,
-    progress,
-    result,
-    errorMessage,
-    errorDetails,
-    cancelError,
-    canDownload,
-    handleDownload,
-    handleCancel,
-    handleReset,
-  } = useDownload();
+    jobs,
+    isSubmitting,
+    enqueueError,
+    initErrorMessage,
+    initErrorDetails,
+    canEnqueue,
+    enqueueCurrentDraft,
+    handleJobCancel,
+  } = useDownloadQueue();
 
   const dependencies = useDependencies();
 
-  const isInitializing = status === "initializing";
-  const isDownloading = status === "downloading";
-  const isCancelling = status === "cancelling";
-  const backendUnreachable = subscription === "failed";
-  const optionsLocked = isDownloading || isCancelling || isInitializing;
+  const isInitializing = initStatus === "initializing";
+  const initFailed = initStatus === "error";
   const isAudio = mediaType === "audio";
-  // Only yt-dlp gates downloads; Deno/FFmpeg degrade gracefully —
-  // except an audio conversion, which needs FFmpeg confirmed available.
+  // Only yt-dlp gates new jobs; Deno/FFmpeg degrade gracefully — except an
+  // audio conversion, which needs FFmpeg confirmed available.
   const ytdlpState = dependencies.report?.ytDlp.state;
   const ytdlpMissing = ytdlpState === "missing" || ytdlpState === "error";
   const ffmpegAvailable = dependencies.report?.ffmpeg.state === "available";
   const needsConversion = isAudio && audioFormat !== "original";
   const conversionBlocked = needsConversion && !ffmpegAvailable;
-  const downloadAllowed = canDownload && !ytdlpMissing && !conversionBlocked;
+  const enqueueAllowed =
+    canEnqueue && !ytdlpMissing && !conversionBlocked && !isSubmitting;
   const showFfmpegNote =
     !isAudio && dependencies.report?.ffmpeg.state === "missing";
 
   // If Refresh revokes FFmpeg while a conversion is selected, fall back to
-  // Original rather than leaving the UI in an un-downloadable state.
+  // Original rather than leaving the draft in an un-enqueueable state.
+  // Queued jobs keep their own snapshots and are never mutated here.
   useEffect(() => {
     if (
       dependencies.report &&
@@ -69,11 +64,18 @@ export default function App() {
       setAudioFormat("original");
     }
   }, [dependencies.report, audioFormat, setAudioFormat]);
+
+  const hasPendingJobs = jobs.some(
+    (job) =>
+      job.status === "queued" ||
+      job.status === "downloading" ||
+      job.status === "cancelling",
+  );
   // While downloading the button falls back to its internal "Downloading…".
   const actionLabel = isInitializing
     ? "Loading…"
-    : isDownloading
-      ? undefined
+    : hasPendingJobs
+      ? "Add to Queue"
       : isAudio
         ? "Download Audio"
         : "Download Video";
@@ -100,17 +102,17 @@ export default function App() {
           value={url}
           onChange={setUrl}
           onSubmit={() => {
-            if (downloadAllowed) {
-              void handleDownload();
+            if (enqueueAllowed) {
+              void enqueueCurrentDraft();
             }
           }}
-          disabled={optionsLocked}
+          disabled={isInitializing || initFailed}
         />
 
         <MediaTypeSelector
           value={mediaType}
           onChange={setMediaType}
-          disabled={optionsLocked}
+          disabled={isInitializing || initFailed}
         />
 
         {!isAudio && (
@@ -118,7 +120,7 @@ export default function App() {
             <QualitySelector
               value={quality}
               onChange={setQuality}
-              disabled={optionsLocked}
+              disabled={isInitializing || initFailed}
             />
             {showFfmpegNote && (
               <p className="hint">
@@ -133,7 +135,7 @@ export default function App() {
           <AudioFormatSelector
             value={audioFormat}
             onChange={setAudioFormat}
-            disabled={optionsLocked}
+            disabled={isInitializing || initFailed}
             conversionsEnabled={ffmpegAvailable}
           />
         )}
@@ -141,78 +143,56 @@ export default function App() {
         <OutputFolderSelector
           value={outputDirectory}
           onBrowse={chooseOutputDirectory}
-          disabled={optionsLocked}
+          disabled={isInitializing || initFailed}
         />
 
         <DownloadButton
-          disabled={!downloadAllowed}
-          loading={isDownloading || isInitializing}
+          disabled={!enqueueAllowed}
+          loading={isInitializing || isSubmitting}
           label={actionLabel}
           onClick={() => {
-            if (downloadAllowed) {
-              void handleDownload();
+            if (enqueueAllowed) {
+              void enqueueCurrentDraft();
             }
           }}
         />
 
-        {ytdlpMissing && !isDownloading && (
+        {ytdlpMissing && (
           <p className="hint hint--error" role="note">
             Downloads unavailable: yt-dlp is{" "}
             {ytdlpState === "error" ? "reporting an error" : "missing"}.
           </p>
         )}
 
-        {conversionBlocked && !isDownloading && (
+        {conversionBlocked && (
           <p className="hint hint--error" role="note">
             FFmpeg is required to convert audio to{" "}
             {AUDIO_FORMAT_LABELS[audioFormat]}.
           </p>
         )}
 
-        {isDownloading && <DownloadProgress progress={progress} />}
-
-        {(isDownloading || isCancelling) && (
-          <CancelButton
-            cancelling={isCancelling}
-            onClick={() => {
-              void handleCancel();
-            }}
-          />
-        )}
-
-        {cancelError && (isDownloading || isCancelling) && (
+        {enqueueError && (
           <p className="hint hint--error" role="alert">
-            {cancelError}
+            {enqueueError}
           </p>
         )}
 
-        {status === "success" && result && (
-          <StatusMessage
-            kind="success"
-            title="Download complete"
-            result={result}
-            onReset={handleReset}
-          />
+        {initFailed && (
+          <p className="hint hint--error" role="alert">
+            {initErrorMessage}
+            {initErrorDetails ? ` Details: ${initErrorDetails}` : ""}
+          </p>
         )}
 
-        {status === "cancelled" && (
-          <StatusMessage
-            kind="cancelled"
-            title="Download cancelled"
-            message="The download was stopped."
-            onReset={handleReset}
-          />
-        )}
-
-        {status === "error" && (
-          <StatusMessage
-            kind="error"
-            title={backendUnreachable ? "Application error" : "Download failed"}
-            message={errorMessage}
-            details={errorDetails}
-            onReset={backendUnreachable ? null : handleReset}
-          />
-        )}
+        <QueueSection
+          jobs={jobs}
+          onCancel={(jobId) => {
+            void handleJobCancel(jobId);
+          }}
+          onRemove={(jobId) => {
+            void handleJobCancel(jobId);
+          }}
+        />
 
         <DependencySection
           status={dependencies.status}

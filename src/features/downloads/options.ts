@@ -65,7 +65,7 @@ export const DEFAULT_VIDEO_QUALITY: VideoQuality = "best";
 export const DEFAULT_AUDIO_FORMAT: AudioFormat = "original";
 
 /**
- * Structured download request sent to the `start_download` Tauri command.
+ * Structured download request sent to the `enqueue_download` Tauri command.
  * `quality` is the selected video preset (video only); `audioFormat` is the
  * selected audio format (audio only, `null` never sent — audio always
  * carries an explicit format, defaulting to Original). `outputDirectory`
