@@ -32,6 +32,24 @@ export const MEDIA_TYPE_LABELS: Record<MediaType, string> = {
   audio: "Audio",
 };
 
+export type AudioFormat = "original" | "mp3" | "m4a" | "wav" | "flac";
+
+export const AUDIO_FORMATS: readonly AudioFormat[] = [
+  "original",
+  "mp3",
+  "m4a",
+  "wav",
+  "flac",
+];
+
+export const AUDIO_FORMAT_LABELS: Record<AudioFormat, string> = {
+  original: "Original",
+  mp3: "MP3",
+  m4a: "M4A",
+  wav: "WAV",
+  flac: "FLAC",
+};
+
 export const VIDEO_QUALITY_LABELS: Record<VideoQuality, string> = {
   best: "Best",
   "2160": "2160p",
@@ -44,18 +62,22 @@ export const VIDEO_QUALITY_LABELS: Record<VideoQuality, string> = {
 
 export const DEFAULT_MEDIA_TYPE: MediaType = "video";
 export const DEFAULT_VIDEO_QUALITY: VideoQuality = "best";
+export const DEFAULT_AUDIO_FORMAT: AudioFormat = "original";
 
 /**
  * Structured download request sent to the `start_download` Tauri command.
- * `quality` is the selected video preset, or `null` for audio (which takes
- * no video quality). `outputDirectory` is the validated folder the user
- * picked; the backend still builds the yt-dlp `-o` template itself.
+ * `quality` is the selected video preset (video only); `audioFormat` is the
+ * selected audio format (audio only, `null` never sent — audio always
+ * carries an explicit format, defaulting to Original). `outputDirectory`
+ * is the validated folder the user picked; the backend still builds the
+ * yt-dlp `-o` template itself.
  * Serialized camelCase to match the Rust `StartDownloadRequest`.
  */
 export interface DownloadRequest {
   url: string;
   mediaType: MediaType;
   quality: VideoQuality | null;
+  audioFormat: AudioFormat | null;
   outputDirectory: string;
 }
 
@@ -63,12 +85,14 @@ export function buildDownloadRequest(
   url: string,
   mediaType: MediaType,
   quality: VideoQuality,
+  audioFormat: AudioFormat,
   outputDirectory: string,
 ): DownloadRequest {
   return {
     url: url.trim(),
     mediaType,
     quality: mediaType === "video" ? quality : null,
+    audioFormat: mediaType === "audio" ? audioFormat : null,
     outputDirectory,
   };
 }

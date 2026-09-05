@@ -106,6 +106,7 @@ describe("useDownload event readiness", () => {
         url: "https://example.com/video",
         mediaType: "video",
         quality: "best",
+        audioFormat: null,
         outputDirectory: TEST_DOWNLOADS_DIR,
       },
     });

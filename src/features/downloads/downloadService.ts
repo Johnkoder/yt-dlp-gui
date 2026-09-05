@@ -72,13 +72,29 @@ export function friendlyErrorMessage(
   mediaType?: MediaType,
 ): string {
   const lower = raw.toLowerCase();
-  if (
-    lower.includes("ffmpeg") &&
-    (lower.includes("not installed") ||
+  if (lower.includes("ffmpeg")) {
+    // The backend's conversion rejection names the format precisely;
+    // surface it verbatim instead of the generic merge guidance.
+    if (lower.includes("convert audio to")) {
+      const firstLine = raw
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      return firstLine ?? raw;
+    }
+    if (mediaType === "audio") {
+      return "FFmpeg is required for audio conversion. Install FFmpeg or choose the Original format.";
+    }
+    if (
+      lower.includes("not installed") ||
       lower.includes("not found") ||
-      lower.includes("required"))
-  ) {
-    return "FFmpeg is required to merge this video quality. Install FFmpeg or choose a format that does not require merging.";
+      lower.includes("required")
+    ) {
+      return "FFmpeg is required to merge this video quality. Install FFmpeg or choose a format that does not require merging.";
+    }
+  }
+  if (mediaType === "audio" && lower.includes("postprocessing")) {
+    return "Audio conversion failed. See details below.";
   }
   if (
     lower.includes("requested format is not available") ||

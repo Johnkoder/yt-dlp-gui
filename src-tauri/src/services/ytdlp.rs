@@ -69,16 +69,58 @@ impl VideoQuality {
     }
 }
 
+/// Audio format presets. The frontend deals in these semantic values —
+/// never in yt-dlp post-processing flags. Unknown strings fail
+/// deserialization, so a malicious value can never become an argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFormat {
+    Original,
+    Mp3,
+    M4a,
+    Wav,
+    Flac,
+}
+
+impl AudioFormat {
+    /// Converted formats need FFmpeg; Original downloads natively.
+    fn requires_ffmpeg(self) -> bool {
+        !matches!(self, AudioFormat::Original)
+    }
+
+    /// Display name for messages (MP3, M4A, WAV, FLAC, Original).
+    fn display_name(self) -> &'static str {
+        match self {
+            AudioFormat::Original => "Original",
+            AudioFormat::Mp3 => "MP3",
+            AudioFormat::M4a => "M4A",
+            AudioFormat::Wav => "WAV",
+            AudioFormat::Flac => "FLAC",
+        }
+    }
+
+    /// yt-dlp `--audio-format` value, or `None` for native (no conversion).
+    fn as_postprocess_arg(self) -> Option<&'static str> {
+        match self {
+            AudioFormat::Original => None,
+            AudioFormat::Mp3 => Some("mp3"),
+            AudioFormat::M4a => Some("m4a"),
+            AudioFormat::Wav => Some("wav"),
+            AudioFormat::Flac => Some("flac"),
+        }
+    }
+}
 /// Structured download request from the frontend (camelCase over IPC).
-/// `quality` is meaningful for video only; audio requests must send `None`.
-/// `output_directory` is the user-selected folder; `None` means the normal
-/// Downloads folder. The frontend never builds yt-dlp arguments.
+/// `quality` is meaningful for video only; `audio_format` for audio only.
+/// The frontend never builds yt-dlp arguments.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartDownloadRequest {
     pub url: String,
     pub media_type: MediaType,
     pub quality: Option<VideoQuality>,
+    #[serde(default)]
+    pub audio_format: Option<AudioFormat>,
     /// Omitted (or null) means the normal Downloads folder.
     #[serde(default)]
     pub output_directory: Option<String>,
@@ -98,6 +140,8 @@ pub struct DownloadOptions {
     pub media_type: MediaType,
     /// Resolved quality for video; always `None` for audio.
     pub quality: Option<VideoQuality>,
+    /// Resolved audio format for audio; always `None` for video.
+    pub audio_format: Option<AudioFormat>,
     pub subtitles: bool,
     pub playlist: bool,
 }
@@ -108,12 +152,14 @@ impl DownloadOptions {
         output_directory: PathBuf,
         media_type: MediaType,
         quality: Option<VideoQuality>,
+        audio_format: Option<AudioFormat>,
     ) -> Self {
         Self {
             url,
             output_directory,
             media_type,
             quality,
+            audio_format,
             subtitles: false,
             playlist: false,
         }
@@ -148,7 +194,17 @@ pub fn validate_output_directory(path: &str) -> Result<PathBuf, String> {
 /// Validate a frontend request into backend-owned options. Rejects invalid
 /// combinations with understandable errors instead of panicking. A missing
 /// output directory falls back to the normal Downloads folder.
+///
+/// Conversion formats need FFmpeg; the check is injected so tests control it
+/// without touching the real environment.
 pub fn validate_request(request: &StartDownloadRequest) -> Result<DownloadOptions, String> {
+    validate_request_with(request, super::dependencies::resolve_ffmpeg().is_some())
+}
+
+pub fn validate_request_with(
+    request: &StartDownloadRequest,
+    ffmpeg_available: bool,
+) -> Result<DownloadOptions, String> {
     let url = request.url.trim().to_string();
     if url.is_empty() {
         return Err("Please paste a video URL first.".to_string());
@@ -162,20 +218,35 @@ pub fn validate_request(request: &StartDownloadRequest) -> Result<DownloadOption
             if request.quality.is_some() {
                 return Err("Audio downloads do not take a video quality.".to_string());
             }
+            // Default to Original when the frontend omits the format.
+            let format = request.audio_format.unwrap_or(AudioFormat::Original);
+            if format.requires_ffmpeg() && !ffmpeg_available {
+                return Err(format!(
+                    "FFmpeg is required to convert audio to {}.",
+                    format.display_name()
+                ));
+            }
             Ok(DownloadOptions::new(
                 url,
                 output_directory,
                 MediaType::Audio,
                 None,
+                Some(format),
             ))
         }
-        MediaType::Video => Ok(DownloadOptions::new(
-            url,
-            output_directory,
-            MediaType::Video,
-            // Default to Best when the frontend omits it.
-            Some(request.quality.unwrap_or(VideoQuality::Best)),
-        )),
+        MediaType::Video => {
+            if request.audio_format.is_some() {
+                return Err("Video downloads do not take an audio format.".to_string());
+            }
+            Ok(DownloadOptions::new(
+                url,
+                output_directory,
+                MediaType::Video,
+                // Default to Best when the frontend omits it.
+                Some(request.quality.unwrap_or(VideoQuality::Best)),
+                None,
+            ))
+        }
     }
 }
 
@@ -364,6 +435,20 @@ pub fn build_download_args(options: &DownloadOptions, final_path_file: &Path) ->
         "-o".to_string(),
         template,
     ];
+
+    // Audio conversion via yt-dlp post-processing (FFmpeg). Original stays
+    // a pure native download: no -x, no --extract-audio, no --audio-format.
+    if options.media_type == MediaType::Audio {
+        if let Some(converted) = options
+            .audio_format
+            .unwrap_or(AudioFormat::Original)
+            .as_postprocess_arg()
+        {
+            args.push("-x".to_string());
+            args.push("--audio-format".to_string());
+            args.push(converted.to_string());
+        }
+    }
 
     if options.subtitles {
         args.push("--write-subs".to_string());
@@ -853,6 +938,7 @@ mod tests {
             PathBuf::from("C:\\Users\\Alex\\Downloads"),
             MediaType::Video,
             Some(VideoQuality::Best),
+            None,
         );
         let sidecar = PathBuf::from("C:\\Temp\\ytdlp-gui-final-1.txt");
         let args = build_download_args(&options, &sidecar);
@@ -915,6 +1001,7 @@ mod tests {
                 PathBuf::from("C:\\dl"),
                 MediaType::Video,
                 Some(quality),
+                None,
             );
             let args = build_download_args(&options, Path::new("sidecar.txt"));
             let format = format_value(&args);
@@ -948,6 +1035,7 @@ mod tests {
             PathBuf::from("C:\\dl"),
             MediaType::Audio,
             None,
+            Some(AudioFormat::Original),
         );
         let args = build_download_args(&options, Path::new("sidecar.txt"));
         let format = format_value(&args);
@@ -972,6 +1060,55 @@ mod tests {
             "audio mode takes no quality constraint, got: {:?}",
             args
         );
+    }
+
+    #[test]
+    fn builds_audio_conversion_args() {
+        // Table: format → expected --audio-format value. No --audio-quality
+        // in this phase, and -f stays native `ba` for every conversion.
+        for (format, arg) in [
+            (AudioFormat::Mp3, "mp3"),
+            (AudioFormat::M4a, "m4a"),
+            (AudioFormat::Wav, "wav"),
+            (AudioFormat::Flac, "flac"),
+        ] {
+            let options = DownloadOptions::new(
+                "https://example.com/v".to_string(),
+                PathBuf::from("C:\\dl"),
+                MediaType::Audio,
+                None,
+                Some(format),
+            );
+            let args = build_download_args(&options, Path::new("sidecar.txt"));
+            assert_eq!(
+                format_value(&args),
+                "ba",
+                "conversion source must stay native audio"
+            );
+            assert!(
+                args.contains(&"-x".to_string()),
+                "{:?} must extract audio, got: {:?}",
+                format,
+                args
+            );
+            let audio_format = args
+                .iter()
+                .skip_while(|a| a.as_str() != "--audio-format")
+                .nth(1)
+                .expect("--audio-format must carry a value");
+            assert_eq!(audio_format, arg);
+            assert!(
+                !args.iter().any(|a| a == "--audio-quality"),
+                "{:?} must not set quality yet, got: {:?}",
+                format,
+                args
+            );
+            assert_eq!(
+                args.last().unwrap(),
+                "https://example.com/v",
+                "URL stays the single trailing argument"
+            );
+        }
     }
 
     #[test]
@@ -1009,10 +1146,21 @@ mod tests {
         assert!(serde_json::from_str::<VideoQuality>("\"137\"").is_err());
         assert!(serde_json::from_str::<VideoQuality>("\"1080;evil\"").is_err());
         assert!(serde_json::from_str::<VideoQuality>("\"bestvideo+bestaudio\"").is_err());
+        // Unknown audio formats fail too — only the five presets parse.
+        assert!(serde_json::from_str::<AudioFormat>("\"MP3\"").is_err());
+        assert!(serde_json::from_str::<AudioFormat>("\"ogg\"").is_err());
+        assert!(serde_json::from_str::<AudioFormat>("\"mp3; rm -rf ~\"").is_err());
+        assert!(serde_json::from_str::<AudioFormat>("\"-x --audio-format mp3\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<AudioFormat>("\"mp3\"").expect("mp3 parses"),
+            AudioFormat::Mp3
+        );
         // A full hostile request is rejected before any argument is built.
         let hostile =
             r#"{"url":"https://example.com/v","mediaType":"video","quality":"bv*+ba; rm -rf ~"}"#;
         assert!(serde_json::from_str::<StartDownloadRequest>(hostile).is_err());
+        let hostile_audio = r#"{"url":"https://example.com/v","mediaType":"audio","quality":null,"audioFormat":"mp3;evil"}"#;
+        assert!(serde_json::from_str::<StartDownloadRequest>(hostile_audio).is_err());
         // Valid spellings still parse.
         let ok: StartDownloadRequest = serde_json::from_str(
             r#"{"url":"https://example.com/v","mediaType":"audio","quality":null}"#,
@@ -1028,6 +1176,7 @@ mod tests {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Audio,
             quality: Some(VideoQuality::P1080),
+            audio_format: None,
             output_directory: Some(std::env::temp_dir().to_string_lossy().to_string()),
         };
         let err = validate_request(&request).expect_err("audio + quality must be rejected");
@@ -1041,12 +1190,14 @@ mod tests {
             url: "  https://example.com/v  ".to_string(),
             media_type: MediaType::Video,
             quality: Some(VideoQuality::P720),
+            audio_format: None,
             output_directory: Some(tmp.clone()),
         };
         let options = validate_request(&video).expect("video + quality must validate");
         assert_eq!(options.url, "https://example.com/v");
         assert_eq!(options.media_type, MediaType::Video);
         assert_eq!(options.quality, Some(VideoQuality::P720));
+        assert_eq!(options.audio_format, None);
         assert_eq!(options.output_directory, std::env::temp_dir());
 
         // Omitted video quality defaults to Best.
@@ -1054,6 +1205,7 @@ mod tests {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Video,
             quality: None,
+            audio_format: None,
             output_directory: Some(tmp.clone()),
         };
         let options = validate_request(&defaulted).expect("video without quality must default");
@@ -1063,11 +1215,72 @@ mod tests {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Audio,
             quality: None,
+            audio_format: None,
             output_directory: Some(tmp),
         };
         let options = validate_request(&audio).expect("audio must validate");
         assert_eq!(options.media_type, MediaType::Audio);
         assert_eq!(options.quality, None);
+        assert_eq!(options.audio_format, Some(AudioFormat::Original));
+    }
+
+    #[test]
+    fn validate_request_rejects_video_with_audio_format() {
+        for format in [AudioFormat::Original, AudioFormat::Mp3, AudioFormat::M4a] {
+            let request = StartDownloadRequest {
+                url: "https://example.com/v".to_string(),
+                media_type: MediaType::Video,
+                quality: Some(VideoQuality::Best),
+                audio_format: Some(format),
+                output_directory: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            };
+            let err =
+                validate_request(&request).expect_err("video + audio format must be rejected");
+            assert!(err.contains("audio format"), "unexpected message: {}", err);
+        }
+    }
+
+    #[test]
+    fn validate_request_enforces_ffmpeg_for_conversion() {
+        let tmp = || Some(std::env::temp_dir().to_string_lossy().to_string());
+        // Original never needs FFmpeg.
+        let original = StartDownloadRequest {
+            url: "https://example.com/v".to_string(),
+            media_type: MediaType::Audio,
+            quality: None,
+            audio_format: Some(AudioFormat::Original),
+            output_directory: tmp(),
+        };
+        let options = validate_request_with(&original, false)
+            .expect("original + missing FFmpeg must validate");
+        assert_eq!(options.audio_format, Some(AudioFormat::Original));
+
+        // Every conversion format is rejected without FFmpeg…
+        for format in [
+            AudioFormat::Mp3,
+            AudioFormat::M4a,
+            AudioFormat::Wav,
+            AudioFormat::Flac,
+        ] {
+            let request = StartDownloadRequest {
+                url: "https://example.com/v".to_string(),
+                media_type: MediaType::Audio,
+                quality: None,
+                audio_format: Some(format),
+                output_directory: tmp(),
+            };
+            let err = validate_request_with(&request, false)
+                .expect_err("conversion without FFmpeg must be rejected");
+            assert!(
+                err.contains("FFmpeg") && err.contains(format.display_name()),
+                "unexpected message: {}",
+                err
+            );
+            // …and accepted with FFmpeg present.
+            let options = validate_request_with(&request, true)
+                .expect("conversion with FFmpeg must validate");
+            assert_eq!(options.audio_format, Some(format));
+        }
     }
 
     #[test]
@@ -1113,6 +1326,7 @@ mod tests {
             base.clone(),
             MediaType::Video,
             Some(VideoQuality::P1080),
+            None,
         );
         let args = build_download_args(&options, Path::new("sidecar.txt"));
         let template = args
@@ -1169,6 +1383,7 @@ mod tests {
             PathBuf::from("C:\\dl"),
             MediaType::Audio,
             None,
+            Some(AudioFormat::Original),
         );
         let args = build_download_args(&options, &sidecar);
         let position = args

@@ -295,10 +295,17 @@ async fn check_deno() -> DependencyInfo {
     }
 }
 
+/// Resolve the FFmpeg binary: normal PATH lookup. Shared by the dependency
+/// checker and download validation so both agree on what "available" means.
+/// (PATH-only by design: anything found this way is automatically usable by
+/// the yt-dlp child process through its inherited environment.)
+pub fn resolve_ffmpeg() -> Option<PathBuf> {
+    find_executable_on_path("ffmpeg.exe")
+}
+
 async fn check_ffmpeg() -> DependencyInfo {
     const NAME: &str = "FFmpeg";
-    const FILE: &str = "ffmpeg.exe";
-    let binary = match find_executable_on_path(FILE) {
+    let binary = match resolve_ffmpeg() {
         Some(path) => path,
         None => {
             return missing(

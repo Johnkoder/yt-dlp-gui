@@ -15,11 +15,11 @@ tool yt-dlp uses for merging separate streams and future conversion.
 ## Current features
 
 - Paste a video URL and download it with one click (Enter works too)
-- Download type: **Video** or **Audio**. Audio downloads the best
-  available **audio-only** stream and keeps the native source
-  container/codec (such as `.m4a`/`.webm`); it never falls back to a
-  video file, does not convert to MP3 yet, and fails with an
-  understandable error when no audio-only format exists
+- Download type: **Video** or **Audio**. Audio offers **Original**
+  (best native audio-only stream, no conversion) plus **MP3 / M4A /
+  WAV / FLAC** conversion via FFmpeg. Conversion needs an `ffmpeg` on
+  `PATH`; without it, conversion choices are locked and Original still
+  works. FFmpeg is never installed automatically
 - Video quality presets: **Best / 2160p / 1440p / 1080p / 720p / 480p /
   360p** (best stream at or below the chosen height, plus best audio,
   with a fallback when separate streams are unavailable)
@@ -94,6 +94,7 @@ yt-dlp-gui/
 │   ├── components/            # UrlInput, DownloadButton,
 │   │                          # DownloadProgress, StatusMessage,
 │   │                          # MediaTypeSelector, QualitySelector,
+│   │                          # AudioFormatSelector,
 │   │                          # OutputFolderSelector, DependencySection
 │   ├── features/downloads/
 │   │   ├── hooks/useDownload.ts   # initializing|ready|downloading|success|error
@@ -223,12 +224,12 @@ Completed:
 - video / native-audio download mode
 - output folder selection (native picker, remembered, safe fallback)
 - dependency detection (bundled yt-dlp, system Deno, system FFmpeg)
+- audio format conversion (Original/MP3/M4A/WAV/FLAC via FFmpeg)
 
 Possible next:
-- FFmpeg-assisted audio conversion / MP3
-- dependency setup assistance
 - cancellation
-- queue
+- download queue
+- playlist support
 etc.
 
 ## License

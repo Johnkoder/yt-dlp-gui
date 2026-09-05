@@ -179,6 +179,7 @@ describe("App download options", () => {
         url: "https://example.com/v",
         mediaType: "video",
         quality: "1080",
+        audioFormat: null,
         outputDirectory: DEFAULT_DIR,
       },
     });
@@ -199,6 +200,7 @@ describe("App download options", () => {
         url: "https://example.com/v",
         mediaType: "audio",
         quality: null,
+        audioFormat: "original",
         outputDirectory: DEFAULT_DIR,
       },
     });
@@ -262,6 +264,7 @@ describe("App download options", () => {
         url: "https://example.com/v",
         mediaType: "video",
         quality: "best",
+        audioFormat: null,
         outputDirectory: CUSTOM_DIR,
       },
     });
@@ -468,8 +471,169 @@ describe("App dependencies", () => {
         url: "https://example.com/v",
         mediaType: "video",
         quality: "best",
+        audioFormat: null,
         outputDirectory: DEFAULT_DIR,
       },
     });
+  });
+});
+
+describe("App audio formats", () => {
+  function ffmpegMissingReport(): DependencyReport {
+    const report = availableReport();
+    report.ffmpeg = {
+      name: "FFmpeg",
+      state: "missing",
+      version: null,
+      path: null,
+      message: "FFmpeg was not found.",
+    };
+    return report;
+  }
+
+  it("video mode shows Quality and hides Audio format", async () => {
+    await renderReadyApp();
+
+    expect(screen.getByLabelText("Quality")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Audio format")).not.toBeInTheDocument();
+  });
+
+  it("audio mode shows Audio format defaulting to Original", async () => {
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    expect(screen.queryByLabelText("Quality")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Audio format")).toHaveValue("original");
+  });
+
+  it("sends the selected conversion format", async () => {
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    fireEvent.change(screen.getByLabelText("Audio format"), {
+      target: { value: "mp3" },
+    });
+    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+      target: { value: "https://example.com/v" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download audio/i }));
+    await act(async () => {});
+    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
+      request: {
+        url: "https://example.com/v",
+        mediaType: "audio",
+        quality: null,
+        audioFormat: "mp3",
+        outputDirectory: DEFAULT_DIR,
+      },
+    });
+  });
+
+  it("preserves selections when switching modes", async () => {
+    await renderReadyApp();
+
+    fireEvent.change(screen.getByLabelText("Quality"), {
+      target: { value: "720" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    fireEvent.change(screen.getByLabelText("Audio format"), {
+      target: { value: "flac" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: "Video" }));
+    expect(screen.getByLabelText("Quality")).toHaveValue("720");
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    expect(screen.getByLabelText("Audio format")).toHaveValue("flac");
+  });
+
+  it("missing FFmpeg leaves Original usable but locks conversions", async () => {
+    mockBackend(ffmpegMissingReport());
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    const select = screen.getByLabelText("Audio format") as HTMLSelectElement;
+    expect(select).toBeEnabled();
+    const mp3 = Array.from(select.options).find(
+      (option) => option.value === "mp3",
+    );
+    expect(mp3?.disabled).toBe(true);
+    expect(mp3?.textContent).toMatch(/FFmpeg required/);
+
+    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+      target: { value: "https://example.com/v" },
+    });
+    expect(
+      screen.getByRole("button", { name: /download audio/i }),
+    ).toBeEnabled();
+  });
+
+  it("loading dependencies does not falsely unlock conversions", async () => {
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "check_dependencies") {
+        return new Promise(() => {});
+      }
+      return defaultAnswer(command, args);
+    });
+    activeListen();
+    render(<App />);
+    await act(async () => {});
+
+    // Output init resolves, but FFmpeg status is still unknown.
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    const select = screen.getByLabelText("Audio format") as HTMLSelectElement;
+    const mp3 = Array.from(select.options).find(
+      (option) => option.value === "mp3",
+    );
+    expect(mp3?.disabled).toBe(true);
+    // Original itself stays selectable.
+    expect(select).toBeEnabled();
+  });
+
+  it("refresh falling back to Original when FFmpeg disappears", async () => {
+    const reports = [availableReport(), ffmpegMissingReport()];
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "check_dependencies") {
+        return Promise.resolve(reports.shift() ?? availableReport());
+      }
+      return defaultAnswer(command, args);
+    });
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    fireEvent.change(screen.getByLabelText("Audio format"), {
+      target: { value: "mp3" },
+    });
+    expect(screen.getByLabelText("Audio format")).toHaveValue("mp3");
+
+    fireEvent.click(screen.getByRole("button", { name: /refresh/i }));
+    await act(async () => {});
+    await act(async () => {});
+    expect(screen.getByLabelText("Audio format")).toHaveValue("original");
+    // No download was triggered by the fallback.
+    const started = mockInvoke.mock.calls.filter(
+      ([command]) => command === "start_download",
+    );
+    expect(started).toHaveLength(0);
+  });
+
+  it("audio format selector locks while downloading", async () => {
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "check_dependencies") {
+        return Promise.resolve(availableReport());
+      }
+      if (command === "get_downloads_dir") {
+        return Promise.resolve(DEFAULT_DIR);
+      }
+      return new Promise(() => {});
+    });
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Audio" }));
+    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+      target: { value: "https://example.com/v" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download audio/i }));
+    await act(async () => {});
+
+    expect(screen.getByLabelText("Audio format")).toBeDisabled();
   });
 });

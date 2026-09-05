@@ -1,11 +1,14 @@
+import { useEffect } from "react";
 import { DependencySection } from "./components/DependencySection";
 import { DownloadButton } from "./components/DownloadButton";
 import { DownloadProgress } from "./components/DownloadProgress";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
 import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
+import { AudioFormatSelector } from "./components/AudioFormatSelector";
 import { StatusMessage } from "./components/StatusMessage";
 import { UrlInput } from "./components/UrlInput";
+import { AUDIO_FORMAT_LABELS } from "./features/downloads/options";
 import { useDependencies } from "./features/dependencies/hooks/useDependencies";
 import { useDownload } from "./features/downloads/hooks/useDownload";
 import "./App.css";
@@ -20,6 +23,8 @@ export default function App() {
     setMediaType,
     quality,
     setQuality,
+    audioFormat,
+    setAudioFormat,
     outputDirectory,
     chooseOutputDirectory,
     progress,
@@ -38,12 +43,28 @@ export default function App() {
   const backendUnreachable = subscription === "failed";
   const optionsLocked = isDownloading || isInitializing;
   const isAudio = mediaType === "audio";
-  // Only yt-dlp gates downloads; Deno/FFmpeg degrade gracefully.
+  // Only yt-dlp gates downloads; Deno/FFmpeg degrade gracefully —
+  // except an audio conversion, which needs FFmpeg confirmed available.
   const ytdlpState = dependencies.report?.ytDlp.state;
   const ytdlpMissing = ytdlpState === "missing" || ytdlpState === "error";
-  const downloadAllowed = canDownload && !ytdlpMissing;
+  const ffmpegAvailable = dependencies.report?.ffmpeg.state === "available";
+  const needsConversion = isAudio && audioFormat !== "original";
+  const conversionBlocked = needsConversion && !ffmpegAvailable;
+  const downloadAllowed = canDownload && !ytdlpMissing && !conversionBlocked;
   const showFfmpegNote =
     !isAudio && dependencies.report?.ffmpeg.state === "missing";
+
+  // If Refresh revokes FFmpeg while a conversion is selected, fall back to
+  // Original rather than leaving the UI in an un-downloadable state.
+  useEffect(() => {
+    if (
+      dependencies.report &&
+      dependencies.report.ffmpeg.state !== "available" &&
+      audioFormat !== "original"
+    ) {
+      setAudioFormat("original");
+    }
+  }, [dependencies.report, audioFormat, setAudioFormat]);
   // While downloading the button falls back to its internal "Downloading…".
   const actionLabel = isInitializing
     ? "Loading…"
@@ -104,6 +125,15 @@ export default function App() {
           </>
         )}
 
+        {isAudio && (
+          <AudioFormatSelector
+            value={audioFormat}
+            onChange={setAudioFormat}
+            disabled={optionsLocked}
+            conversionsEnabled={ffmpegAvailable}
+          />
+        )}
+
         <OutputFolderSelector
           value={outputDirectory}
           onBrowse={chooseOutputDirectory}
@@ -125,6 +155,13 @@ export default function App() {
           <p className="hint hint--error" role="note">
             Downloads unavailable: yt-dlp is{" "}
             {ytdlpState === "error" ? "reporting an error" : "missing"}.
+          </p>
+        )}
+
+        {conversionBlocked && !isDownloading && (
+          <p className="hint hint--error" role="note">
+            FFmpeg is required to convert audio to{" "}
+            {AUDIO_FORMAT_LABELS[audioFormat]}.
           </p>
         )}
 

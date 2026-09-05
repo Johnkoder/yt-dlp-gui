@@ -8,9 +8,11 @@ import {
   validateOutputDirectory,
 } from "../downloadService";
 import {
+  DEFAULT_AUDIO_FORMAT,
   DEFAULT_MEDIA_TYPE,
   DEFAULT_VIDEO_QUALITY,
   buildDownloadRequest,
+  type AudioFormat,
   type MediaType,
   type VideoQuality,
 } from "../options";
@@ -36,6 +38,8 @@ export interface UseDownloadState {
   setMediaType: (mediaType: MediaType) => void;
   quality: VideoQuality;
   setQuality: (quality: VideoQuality) => void;
+  audioFormat: AudioFormat;
+  setAudioFormat: (format: AudioFormat) => void;
   /** Resolved output folder; null until startup initialization finishes. */
   outputDirectory: string | null;
   setOutputDirectory: (path: string) => void;
@@ -69,6 +73,10 @@ export function useDownload(): UseDownloadState {
     useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [quality, setQualityState] = useState<VideoQuality>(
     DEFAULT_VIDEO_QUALITY,
+  );
+  // Independent selection state: switching modes preserves both choices.
+  const [audioFormat, setAudioFormatState] = useState<AudioFormat>(
+    DEFAULT_AUDIO_FORMAT,
   );
   const [outputDirectory, setOutputDirectoryState] = useState<string | null>(
     null,
@@ -220,6 +228,10 @@ export function useDownload(): UseDownloadState {
     setQualityState(value);
   }, []);
 
+  const setAudioFormat = useCallback((value: AudioFormat) => {
+    setAudioFormatState(value);
+  }, []);
+
   const setOutputDirectory = useCallback((value: string) => {
     setOutputDirectoryState(value);
     saveOutputDirectory(value);
@@ -291,7 +303,13 @@ export function useDownload(): UseDownloadState {
     setStatus("downloading");
     try {
       await startDownload(
-        buildDownloadRequest(target, mediaType, quality, destination),
+        buildDownloadRequest(
+          target,
+          mediaType,
+          quality,
+          audioFormat,
+          destination,
+        ),
       );
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
@@ -299,7 +317,7 @@ export function useDownload(): UseDownloadState {
       setErrorDetails(raw);
       setStatus("error");
     }
-  }, [url, mediaType, quality]);
+  }, [url, mediaType, quality, audioFormat]);
 
   const handleReset = useCallback(() => {
     if (
@@ -324,6 +342,8 @@ export function useDownload(): UseDownloadState {
     setMediaType,
     quality,
     setQuality,
+    audioFormat,
+    setAudioFormat,
     outputDirectory,
     setOutputDirectory,
     chooseOutputDirectory: handleChooseOutputDirectory,
