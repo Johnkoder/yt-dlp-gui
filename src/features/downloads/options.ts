@@ -48,23 +48,27 @@ export const DEFAULT_VIDEO_QUALITY: VideoQuality = "best";
 /**
  * Structured download request sent to the `start_download` Tauri command.
  * `quality` is the selected video preset, or `null` for audio (which takes
- * no video quality). Serialized camelCase to match the Rust
- * `StartDownloadRequest`.
+ * no video quality). `outputDirectory` is the validated folder the user
+ * picked; the backend still builds the yt-dlp `-o` template itself.
+ * Serialized camelCase to match the Rust `StartDownloadRequest`.
  */
 export interface DownloadRequest {
   url: string;
   mediaType: MediaType;
   quality: VideoQuality | null;
+  outputDirectory: string;
 }
 
 export function buildDownloadRequest(
   url: string,
   mediaType: MediaType,
   quality: VideoQuality,
+  outputDirectory: string,
 ): DownloadRequest {
   return {
     url: url.trim(),
     mediaType,
     quality: mediaType === "video" ? quality : null,
+    outputDirectory,
   };
 }

@@ -6,13 +6,18 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 
-const { mockInvoke, mockListen } = vi.hoisted(() => ({
+const { mockInvoke, mockListen, mockDialogOpen } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
   mockListen: vi.fn(),
+  mockDialogOpen: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mockInvoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mockListen }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: mockDialogOpen }));
+
+const DEFAULT_DIR = "C:\\Users\\Test\\Downloads";
+const CUSTOM_DIR = "D:\\Videos";
 
 function activeListen() {
   mockListen
@@ -21,16 +26,35 @@ function activeListen() {
     .mockResolvedValueOnce(vi.fn());
 }
 
+/** Route mocked backend commands; stale paths fail validation. */
+function mockBackend() {
+  mockInvoke.mockImplementation((command: string, args?: unknown) => {
+    if (command === "get_downloads_dir") {
+      return Promise.resolve(DEFAULT_DIR);
+    }
+    if (command === "validate_output_directory") {
+      const path = (args as { path: string }).path;
+      return path === "C:\\stale\\gone"
+        ? Promise.reject(new Error("gone"))
+        : Promise.resolve(path);
+    }
+    return Promise.resolve(undefined);
+  });
+}
+
 async function renderReadyApp() {
   activeListen();
   render(<App />);
-  // Flush the subscription promises: initializing -> ready.
+  // Flush subscription + output-folder init: initializing -> ready.
   await act(async () => {});
 }
 
 beforeEach(() => {
-  mockInvoke.mockReset().mockResolvedValue(undefined);
+  mockInvoke.mockReset();
   mockListen.mockReset();
+  mockDialogOpen.mockReset().mockResolvedValue(null);
+  window.localStorage.clear();
+  mockBackend();
 });
 
 // RTL auto-cleanup relies on globals mode; wire it explicitly instead.
@@ -120,6 +144,7 @@ describe("App download options", () => {
         url: "https://example.com/v",
         mediaType: "video",
         quality: "1080",
+        outputDirectory: DEFAULT_DIR,
       },
     });
   });
@@ -139,12 +164,18 @@ describe("App download options", () => {
         url: "https://example.com/v",
         mediaType: "audio",
         quality: null,
+        outputDirectory: DEFAULT_DIR,
       },
     });
   });
 
   it("disables all controls while downloading", async () => {
-    mockInvoke.mockImplementation(() => new Promise(() => {}));
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") {
+        return Promise.resolve(DEFAULT_DIR);
+      }
+      return new Promise(() => {});
+    });
     await renderReadyApp();
 
     fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
@@ -157,8 +188,103 @@ describe("App download options", () => {
     expect(screen.getByRole("radio", { name: "Video" })).toBeDisabled();
     expect(screen.getByRole("radio", { name: "Audio" })).toBeDisabled();
     expect(screen.getByLabelText("Quality")).toBeDisabled();
+    expect(screen.getByLabelText("Output folder")).toBeDisabled();
+    expect(screen.getByRole("button", { name: /browse/i })).toBeDisabled();
     expect(
       screen.getByRole("button", { name: /downloading/i }),
     ).toBeDisabled();
+  });
+
+  it("shows the default output folder on startup", async () => {
+    await renderReadyApp();
+
+    const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
+    expect(folder.value).toBe(DEFAULT_DIR);
+    expect(folder.title).toBe(DEFAULT_DIR);
+  });
+
+  it("browse updates the folder, persists it, and sends it", async () => {
+    mockDialogOpen.mockResolvedValue(CUSTOM_DIR);
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("button", { name: /browse/i }));
+    await act(async () => {});
+
+    expect(mockDialogOpen).toHaveBeenCalled();
+    const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
+    expect(folder.value).toBe(CUSTOM_DIR);
+    expect(window.localStorage.getItem("yt-dlp-gui.outputDirectory")).toBe(
+      CUSTOM_DIR,
+    );
+
+    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+      target: { value: "https://example.com/v" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    expect(mockInvoke).toHaveBeenCalledWith("start_download", {
+      request: {
+        url: "https://example.com/v",
+        mediaType: "video",
+        quality: "best",
+        outputDirectory: CUSTOM_DIR,
+      },
+    });
+  });
+
+  it("cancelled picker preserves the current folder", async () => {
+    mockDialogOpen.mockResolvedValue(null);
+    await renderReadyApp();
+
+    fireEvent.click(screen.getByRole("button", { name: /browse/i }));
+    await act(async () => {});
+
+    const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
+    expect(folder.value).toBe(DEFAULT_DIR);
+    expect(
+      window.localStorage.getItem("yt-dlp-gui.outputDirectory"),
+    ).toBeNull();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("falls back to Downloads for a stale saved folder", async () => {
+    window.localStorage.setItem(
+      "yt-dlp-gui.outputDirectory",
+      "C:\\stale\\gone",
+    );
+    await renderReadyApp();
+
+    const folder = screen.getByLabelText("Output folder") as HTMLInputElement;
+    expect(folder.value).toBe(DEFAULT_DIR);
+    expect(
+      window.localStorage.getItem("yt-dlp-gui.outputDirectory"),
+    ).toBeNull();
+  });
+
+  it("success shows the real folder and Open Folder uses it", async () => {
+    const handlers = new Map<string, (payload: never) => void>();
+    mockListen.mockImplementation((event: string, handler: (p: never) => void) => {
+      handlers.set(event, handler);
+      return Promise.resolve(vi.fn());
+    });
+    render(<App />);
+    await act(async () => {});
+
+    await act(async () => {
+      handlers.get("download-complete")?.({
+        payload: {
+          filename: "video [abc].mp4",
+          filepath: `${CUSTOM_DIR}\\video [abc].mp4`,
+          outputDir: CUSTOM_DIR,
+        },
+      } as never);
+    });
+
+    expect(screen.getByText(`Saved to ${CUSTOM_DIR}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /open folder/i }));
+    await act(async () => {});
+    expect(mockInvoke).toHaveBeenCalledWith("open_output_folder", {
+      path: CUSTOM_DIR,
+    });
   });
 });

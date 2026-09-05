@@ -39,7 +39,8 @@ export interface DownloadResult {
   filename?: string | null;
   /** Full final path, kept for future features (reveal in folder, …). */
   filepath?: string | null;
-  downloadsDir: string;
+  /** The folder this download actually went to. */
+  outputDir: string;
 }
 
 export interface DownloadError {

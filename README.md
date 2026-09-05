@@ -21,11 +21,14 @@ the `yt-dlp.exe` binary, which is bundled as an application resource.
   with a fallback when separate streams are unavailable)
 - Real, live progress parsed from yt-dlp output: percentage, speed, ETA,
   filename — never faked
-- Videos saved to the user's Windows Downloads folder
+- Videos saved to your chosen output folder (default: the system
+  Downloads folder; the last selected folder is remembered between
+  launches, and a missing folder falls back safely to Downloads)
   (`%(title)s [%(id)s].%(ext)s` naming)
 - High-quality video may need FFmpeg to merge separate streams; a missing
   FFmpeg produces an understandable error, never a fake file
-- Clear success state with an **Open Downloads** button
+- Clear success state with an **Open Folder** button that opens the
+  actual folder the download went to
 - Understandable errors (bad URL, unavailable/private video, unavailable
   quality, missing FFmpeg, HTTP and network failures, missing yt-dlp
   binary, missing Deno) with stderr details in the UI
@@ -84,11 +87,13 @@ yt-dlp-gui/
 ├── src/
 │   ├── components/            # UrlInput, DownloadButton,
 │   │                          # DownloadProgress, StatusMessage,
-│   │                          # MediaTypeSelector, QualitySelector
+│   │                          # MediaTypeSelector, QualitySelector,
+│   │                          # OutputFolderSelector
 │   ├── features/downloads/
 │   │   ├── hooks/useDownload.ts   # initializing|ready|downloading|success|error
-│   │   ├── downloadService.ts     # Tauri invoke/listen wrapper + error map
+│   │   ├── downloadService.ts     # Tauri invoke/listen/dialog wrapper + errors
 │   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
+│   │   ├── outputDirectory.ts     # output-folder preference persistence
 │   │   └── types.ts
 │   ├── styles/                # variables.css, globals.css
 │   ├── App.tsx                # composes components (no business logic)
@@ -197,9 +202,9 @@ cargo test             # needs MSVC link.exe on Windows
 Completed:
 - quality selector (Best / 2160p–360p presets)
 - video / native-audio download mode
+- output folder selection (native picker, remembered, safe fallback)
 
 Next:
-- output folder selection
 - dependency detection (FFmpeg / Deno status screen)
 - audio format conversion (MP3, …)
 - download queue · multiple simultaneous downloads · playlists ·

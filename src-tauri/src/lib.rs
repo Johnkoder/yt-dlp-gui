@@ -14,10 +14,12 @@ use commands::DownloadState;
 pub fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .manage(DownloadState::default())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::download::start_download,
             commands::download::get_downloads_dir,
-            commands::download::open_downloads_folder,
+            commands::download::validate_output_directory,
+            commands::download::open_output_folder,
         ])
 }
 

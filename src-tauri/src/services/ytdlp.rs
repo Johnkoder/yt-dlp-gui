@@ -6,8 +6,11 @@
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -15,13 +18,10 @@ pub const PROGRESS_EVENT: &str = "download-progress";
 pub const COMPLETE_EVENT: &str = "download-complete";
 pub const ERROR_EVENT: &str = "download-error";
 
-/// Sentinel prefix for the `--print after_move:` line that reports the real
-/// final file after all merging/post-processing. It deliberately does not
-/// look like yt-dlp's own `[section]` log lines, so it can never be mistaken
-/// for a progress message.
-pub const FINAL_PATH_SENTINEL: &str = "YTDLP_GUI_FINAL_FILE ";
-
 const BINARY_FILE_NAME: &str = "yt-dlp.exe";
+
+/// Uniqueness for per-download sidecar files.
+static FINAL_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// What to download: full video or native audio stream. Strongly typed so
 /// no raw string ever travels deep into the backend.
@@ -70,12 +70,17 @@ impl VideoQuality {
 
 /// Structured download request from the frontend (camelCase over IPC).
 /// `quality` is meaningful for video only; audio requests must send `None`.
+/// `output_directory` is the user-selected folder; `None` means the normal
+/// Downloads folder. The frontend never builds yt-dlp arguments.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StartDownloadRequest {
     pub url: String,
     pub media_type: MediaType,
     pub quality: Option<VideoQuality>,
+    /// Omitted (or null) means the normal Downloads folder.
+    #[serde(default)]
+    pub output_directory: Option<String>,
 }
 
 /// Validated, backend-owned options. Later features (output directory
@@ -114,16 +119,43 @@ impl DownloadOptions {
     }
 }
 
+/// Validate a user-selected output directory. The frontend path is
+/// untrusted input: it must be non-empty, absolute, and an existing
+/// directory. No home-folder restriction — external drives, secondary
+/// volumes, and UNC paths are all legitimate. Spaces, parentheses, and
+/// Unicode need no special handling: the path travels as one argv element.
+pub fn validate_output_directory(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Please choose an output folder first.".to_string());
+    }
+    let dir = PathBuf::from(trimmed);
+    if !dir.is_absolute() {
+        return Err("The output folder must be an absolute path.".to_string());
+    }
+    if !dir.exists() {
+        return Err(
+            "The selected output folder no longer exists. Choose another folder.".to_string(),
+        );
+    }
+    if !dir.is_dir() {
+        return Err("The selected output path is not a folder.".to_string());
+    }
+    Ok(dir)
+}
+
 /// Validate a frontend request into backend-owned options. Rejects invalid
-/// combinations with understandable errors instead of panicking.
-pub fn validate_request(
-    request: &StartDownloadRequest,
-    output_directory: PathBuf,
-) -> Result<DownloadOptions, String> {
+/// combinations with understandable errors instead of panicking. A missing
+/// output directory falls back to the normal Downloads folder.
+pub fn validate_request(request: &StartDownloadRequest) -> Result<DownloadOptions, String> {
     let url = request.url.trim().to_string();
     if url.is_empty() {
         return Err("Please paste a video URL first.".to_string());
     }
+    let output_directory = match &request.output_directory {
+        Some(dir) => validate_output_directory(dir)?,
+        None => resolve_downloads_dir()?,
+    };
     match request.media_type {
         MediaType::Audio => {
             if request.quality.is_some() {
@@ -167,7 +199,8 @@ pub struct DownloadResult {
     pub filename: Option<String>,
     /// Full final path, kept for future features (reveal in folder, …).
     pub filepath: Option<String>,
-    pub downloads_dir: String,
+    /// The folder this download actually went to (custom or Downloads).
+    pub output_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -282,9 +315,10 @@ pub fn format_selector(media_type: MediaType, quality: Option<VideoQuality>) -> 
 /// Build the yt-dlp argument list in one place.
 ///
 /// The binary is executed directly with individual arguments (never via
-/// `cmd.exe /c` with a concatenated string), so the URL is passed as a
-/// single argv element — no quoting or injection concerns.
-pub fn build_download_args(options: &DownloadOptions) -> Vec<String> {
+/// `cmd.exe /c` with a concatenated string), so the URL and the output
+/// template each travel as a single argv element — no quoting or injection
+/// concerns, whatever characters the folder contains.
+pub fn build_download_args(options: &DownloadOptions, final_path_file: &Path) -> Vec<String> {
     let template = options
         .output_directory
         .join("%(title)s [%(id)s].%(ext)s")
@@ -294,13 +328,16 @@ pub fn build_download_args(options: &DownloadOptions) -> Vec<String> {
     let mut args = vec![
         "--newline".to_string(),
         "--no-playlist".to_string(),
-        // `--print` alone suppresses yt-dlp's progress output; `--progress`
-        // re-enables it so live progress and the final-path report coexist.
+        // Explicit: print options can suppress progress output; this keeps
+        // live progress and the final-path report coexisting.
         "--progress".to_string(),
         // Report the real final filepath after all merging/move steps, so the
         // UI never mistakes a temporary video/audio stream file for the result.
-        "--print".to_string(),
-        format!("after_move:{FINAL_PATH_SENTINEL}%(filepath)s"),
+        // A sidecar FILE (not stdout text) carries the path: yt-dlp's piped
+        // stdout mangles non-ANSI characters, while file I/O is exact.
+        "--print-to-file".to_string(),
+        "after_move:%(filepath)s".to_string(),
+        final_path_file.to_string_lossy().to_string(),
         "-f".to_string(),
         format_selector(options.media_type, options.quality),
         "-o".to_string(),
@@ -313,6 +350,25 @@ pub fn build_download_args(options: &DownloadOptions) -> Vec<String> {
 
     args.push(options.url.clone());
     args
+}
+
+/// Per-download sidecar file that receives the real final path. Lives in the
+/// OS temp dir — never in the user's output folder, so no litter survives a
+/// successful run (it is always deleted after being read).
+fn final_path_sidecar() -> PathBuf {
+    let n = FINAL_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("ytdlp-gui-final-{}-{}.txt", std::process::id(), n))
+}
+
+/// Read the final path back: last non-empty line, CRLF tolerant. The file is
+/// deleted either way; a missing or unreadable file yields `None`.
+fn read_final_path_file(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let _ = std::fs::remove_file(path);
+    text.lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(PathBuf::from)
 }
 
 // --- Progress parsing -----------------------------------------------------
@@ -442,16 +498,6 @@ pub fn parse_progress_line(
     None
 }
 
-/// Extract the real final filepath from a `--print after_move:` sentinel
-/// line. Returns `None` for every other line, so progress output and the
-/// final path can never be confused.
-pub fn parse_final_path_line(line: &str) -> Option<PathBuf> {
-    line.strip_prefix(FINAL_PATH_SENTINEL)
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-}
-
 fn file_name_of(path: &std::path::Path) -> Option<String> {
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
@@ -467,7 +513,7 @@ fn file_name_of(path: &std::path::Path) -> Option<String> {
 fn resolve_verified_result(
     final_path: Option<PathBuf>,
     destination_filename: Option<String>,
-    downloads_dir: &std::path::Path,
+    output_dir: &std::path::Path,
 ) -> Result<(Option<String>, Option<String>), String> {
     if let Some(path) = final_path {
         if path.is_file() {
@@ -479,7 +525,7 @@ fn resolve_verified_result(
     }
     match destination_filename {
         Some(name) => {
-            let path = downloads_dir.join(&name);
+            let path = output_dir.join(&name);
             if path.is_file() {
                 let full = path.to_string_lossy().to_string();
                 Ok((Some(name), Some(full)))
@@ -527,8 +573,9 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
         }
     };
 
-    let downloads_dir = options.output_directory.clone();
-    let args = build_download_args(&options);
+    let output_dir = options.output_directory.clone();
+    let final_path_file = final_path_sidecar();
+    let args = build_download_args(&options, &final_path_file);
 
     let mut child = match tokio::process::Command::new(&binary)
         .args(&args)
@@ -540,6 +587,7 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
     {
         Ok(child) => child,
         Err(err) => {
+            let _ = std::fs::remove_file(&final_path_file);
             let message = format!("Could not launch yt-dlp: {}", err);
             emit_error(
                 &app,
@@ -558,6 +606,7 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
         (Some(stdout), Some(stderr)) => (stdout, stderr),
         _ => {
             let _ = child.kill().await;
+            let _ = std::fs::remove_file(&final_path_file);
             let message = "Could not capture the yt-dlp process output.".to_string();
             emit_error(
                 &app,
@@ -583,19 +632,13 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
         },
     );
 
-    // Read stdout line-by-line for live progress. The after_move sentinel
-    // line is captured separately and never shown as progress.
+    // Read stdout line-by-line for live progress.
     let app_for_stdout = app.clone();
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         let mut current_filename: Option<String> = None;
         let mut destination_filename: Option<String> = None;
-        let mut final_path: Option<PathBuf> = None;
         while let Ok(Some(line)) = reader.next_line().await {
-            if let Some(path) = parse_final_path_line(line.trim_end()) {
-                final_path = Some(path);
-                continue;
-            }
             if let Some(progress) = parse_progress_line(&line, &mut current_filename) {
                 if progress.filename.is_some() {
                     destination_filename = progress.filename.clone();
@@ -603,7 +646,7 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
                 emit_progress(&app_for_stdout, &progress);
             }
         }
-        (destination_filename, final_path)
+        destination_filename
     });
 
     // Collect stderr in the background (bounded tail for error display).
@@ -622,18 +665,21 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
     let status = child.wait().await;
     // A panicked reader task must not crash the download flow: fall back to
     // whatever was captured (or nothing) and report the exit status honestly.
-    let (destination_filename, final_path) = stdout_task.await.unwrap_or((None, None));
+    let destination_filename = stdout_task.await.unwrap_or_default();
     let stderr_text = stderr_task.await.unwrap_or_default();
+    // The sidecar carries the real final path (exact bytes, unlike stdout
+    // text); it is consumed and deleted here on every outcome.
+    let final_path = read_final_path_file(&final_path_file);
 
     match status {
         Ok(exit) if exit.success() => {
-            match resolve_verified_result(final_path, destination_filename, &downloads_dir) {
+            match resolve_verified_result(final_path, destination_filename, &output_dir) {
                 Ok((filename, filepath)) => emit_complete(
                     &app,
                     &DownloadResult {
                         filename,
                         filepath,
-                        downloads_dir: downloads_dir.to_string_lossy().to_string(),
+                        output_dir: output_dir.to_string_lossy().to_string(),
                     },
                 ),
                 Err(message) => {
@@ -775,17 +821,20 @@ mod tests {
             MediaType::Video,
             Some(VideoQuality::Best),
         );
-        let args = build_download_args(&options);
+        let sidecar = PathBuf::from("C:\\Temp\\ytdlp-gui-final-1.txt");
+        let args = build_download_args(&options, &sidecar);
         assert!(args.contains(&"--newline".to_string()));
         assert!(args.contains(&"--no-playlist".to_string()));
         assert!(args.contains(&"--progress".to_string()));
-        assert!(args.contains(&"--print".to_string()));
-        assert!(
-            args.iter()
-                .any(|a| a.starts_with("after_move:") && a.contains("%(filepath)s")),
-            "args must request the post-move filepath, got: {:?}",
-            args
-        );
+        // The final path travels via a sidecar FILE (stdout text mangles
+        // non-ANSI characters): template and file are separate argv elements.
+        assert!(args.contains(&"--print-to-file".to_string()));
+        let print_index = args
+            .iter()
+            .position(|a| a == "--print-to-file")
+            .expect("print-to-file present");
+        assert_eq!(args[print_index + 1], "after_move:%(filepath)s");
+        assert_eq!(args[print_index + 2], sidecar.to_string_lossy());
         // Best video: highest-quality video+audio result.
         let format = format_value(&args);
         assert_eq!(format, "bv*+ba/b");
@@ -834,7 +883,7 @@ mod tests {
                 MediaType::Video,
                 Some(quality),
             );
-            let args = build_download_args(&options);
+            let args = build_download_args(&options, Path::new("sidecar.txt"));
             let format = format_value(&args);
             // Constrained best video + best audio, with a progressive
             // fallback when separate streams are unavailable.
@@ -867,7 +916,7 @@ mod tests {
             MediaType::Audio,
             None,
         );
-        let args = build_download_args(&options);
+        let args = build_download_args(&options, Path::new("sidecar.txt"));
         let format = format_value(&args);
         // Best audio-ONLY stream: exactly `ba`, never a `/b` fallback to a
         // combined video+audio format, and never a conversion flag.
@@ -946,78 +995,131 @@ mod tests {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Audio,
             quality: Some(VideoQuality::P1080),
+            output_directory: Some(std::env::temp_dir().to_string_lossy().to_string()),
         };
-        let err = validate_request(&request, PathBuf::from("C:\\dl"))
-            .expect_err("audio + quality must be rejected");
+        let err = validate_request(&request).expect_err("audio + quality must be rejected");
         assert!(err.contains("quality"), "unexpected message: {}", err);
     }
 
     #[test]
     fn validate_request_accepts_valid_combinations() {
+        let tmp = std::env::temp_dir().to_string_lossy().to_string();
         let video = StartDownloadRequest {
             url: "  https://example.com/v  ".to_string(),
             media_type: MediaType::Video,
             quality: Some(VideoQuality::P720),
+            output_directory: Some(tmp.clone()),
         };
-        let options = validate_request(&video, PathBuf::from("C:\\dl"))
-            .expect("video + quality must validate");
+        let options = validate_request(&video).expect("video + quality must validate");
         assert_eq!(options.url, "https://example.com/v");
         assert_eq!(options.media_type, MediaType::Video);
         assert_eq!(options.quality, Some(VideoQuality::P720));
+        assert_eq!(options.output_directory, std::env::temp_dir());
 
         // Omitted video quality defaults to Best.
         let defaulted = StartDownloadRequest {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Video,
             quality: None,
+            output_directory: Some(tmp.clone()),
         };
-        let options = validate_request(&defaulted, PathBuf::from("C:\\dl"))
-            .expect("video without quality must default");
+        let options = validate_request(&defaulted).expect("video without quality must default");
         assert_eq!(options.quality, Some(VideoQuality::Best));
 
         let audio = StartDownloadRequest {
             url: "https://example.com/v".to_string(),
             media_type: MediaType::Audio,
             quality: None,
+            output_directory: Some(tmp),
         };
-        let options =
-            validate_request(&audio, PathBuf::from("C:\\dl")).expect("audio must validate");
+        let options = validate_request(&audio).expect("audio must validate");
         assert_eq!(options.media_type, MediaType::Audio);
         assert_eq!(options.quality, None);
     }
 
     #[test]
-    fn parses_final_path_sentinel() {
-        let path = parse_final_path_line(
-            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\My Video [abc123].mp4",
-        )
-        .expect("sentinel line must parse");
-        assert_eq!(
-            path.to_string_lossy(),
-            "C:\\Users\\Alex\\Downloads\\My Video [abc123].mp4"
+    fn validate_output_directory_rules() {
+        // Empty and relative paths are rejected.
+        assert!(validate_output_directory("").is_err());
+        assert!(validate_output_directory("   ").is_err());
+        assert!(validate_output_directory("relative/folder").is_err());
+        // Missing folders are rejected with a folder-specific message.
+        let missing = std::env::temp_dir().join("ytdlp_gui_no_such_dir_xyz");
+        assert!(!missing.exists());
+        let err = validate_output_directory(&missing.to_string_lossy())
+            .expect_err("missing dir must be rejected");
+        assert!(
+            err.contains("no longer exists"),
+            "unexpected message: {}",
+            err
         );
-        // Progress-looking lines are never mistaken for the final path.
+        // A file is not a directory.
+        let file = std::env::temp_dir().join("ytdlp_gui_not_a_dir.txt");
+        std::fs::write(&file, b"x").expect("test file");
+        let err =
+            validate_output_directory(&file.to_string_lossy()).expect_err("file must be rejected");
+        assert!(err.contains("not a folder"), "unexpected message: {}", err);
+        std::fs::remove_file(&file).ok();
+        // Existing directories pass through unchanged.
+        let dir = std::env::temp_dir();
         assert_eq!(
-            parse_final_path_line("[download]  37.4% of 105.20MiB at 8.40MiB/s ETA 00:08"),
-            None
+            validate_output_directory(&dir.to_string_lossy()).expect("temp dir valid"),
+            dir
         );
-        assert_eq!(
-            parse_final_path_line("[download] Destination: C:\\x\\video.webm"),
-            None
-        );
-        assert_eq!(parse_final_path_line(""), None);
-        assert_eq!(parse_final_path_line("YTDLP_GUI_FINAL_FILE   "), None);
     }
 
     #[test]
-    fn sentinel_is_not_progress() {
-        let mut filename = None;
-        assert!(parse_progress_line(
-            "YTDLP_GUI_FINAL_FILE C:\\Users\\Alex\\Downloads\\final.mp4",
-            &mut filename
+    fn output_template_uses_custom_directory() {
+        // Spaces, parentheses, and Unicode stay intact inside the single
+        // template argument.
+        let base = std::env::temp_dir().join("My Videos (2026) 日本語 🎬");
+        std::fs::create_dir_all(&base).expect("test dir");
+        let options = DownloadOptions::new(
+            "https://example.com/v".to_string(),
+            base.clone(),
+            MediaType::Video,
+            Some(VideoQuality::P1080),
+        );
+        let args = build_download_args(&options, Path::new("sidecar.txt"));
+        let template = args
+            .iter()
+            .skip_while(|a| a.as_str() != "-o")
+            .nth(1)
+            .expect("-o must carry a template");
+        let expected_prefix = base.to_string_lossy().to_string();
+        assert!(
+            template.starts_with(&expected_prefix),
+            "template must live under the custom dir, got: {}",
+            template
+        );
+        assert!(template.ends_with("%(title)s [%(id)s].%(ext)s"));
+        // Template and URL each remain exactly one argv element.
+        assert_eq!(args.iter().filter(|a| a.as_str() == "-o").count(), 1);
+        assert_eq!(args.last().unwrap(), "https://example.com/v");
+        std::fs::remove_dir(&base).ok();
+    }
+
+    #[test]
+    fn reads_final_path_sidecar_file() {
+        // The sidecar carries the exact path (CRLF tolerant); last
+        // non-empty line wins, and the file is consumed.
+        let sidecar = std::env::temp_dir().join("ytdlp_gui_test_sidecar.txt");
+        std::fs::write(
+            &sidecar,
+            "C:\\Vids\\first.mp4\r\nC:\\Vids\\My Video [abc123].mp4\r\n\r\n",
         )
-        .is_none());
-        assert_eq!(filename, None);
+        .expect("test file");
+        let path = read_final_path_file(&sidecar).expect("sidecar must parse");
+        assert_eq!(path.to_string_lossy(), "C:\\Vids\\My Video [abc123].mp4");
+        assert!(!sidecar.exists(), "sidecar must be consumed");
+        // Missing or empty files yield None instead of panicking.
+        assert_eq!(
+            read_final_path_file(&std::env::temp_dir().join("ytdlp_gui_no_sidecar_xyz.txt")),
+            None
+        );
+        let empty = std::env::temp_dir().join("ytdlp_gui_test_sidecar_empty.txt");
+        std::fs::write(&empty, "  \r\n").expect("test file");
+        assert_eq!(read_final_path_file(&empty), None);
     }
 
     #[test]
@@ -1050,8 +1152,8 @@ mod tests {
 
     #[test]
     fn phantom_merged_file_becomes_ffmpeg_error() {
-        // yt-dlp exits 0 but the after_move file was never created (streams
-        // left unmerged without FFmpeg): success must NOT be faked.
+        // yt-dlp exits 0 but the reported final file was never created
+        // (streams left unmerged without FFmpeg): success must NOT be faked.
         let dir = std::env::temp_dir();
         let phantom = dir.join("ytdlp_gui_test_phantom_xyz.mp4");
         assert!(!phantom.exists());

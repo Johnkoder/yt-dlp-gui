@@ -1,0 +1,60 @@
+.folder-row {
+  display: flex;
+  gap: 8px;
+}
+
+.folder-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-size: 13px;
+  padding: 10px 12px;
+  outline: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: default;
+  user-select: text;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.folder-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.25);
+  color: var(--text-primary);
+}
+
+.folder-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.browse-button {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 0 14px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.browse-button:hover:not(:disabled) {
+  background: #2e3440;
+  border-color: #3a4150;
+}
+
+.browse-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

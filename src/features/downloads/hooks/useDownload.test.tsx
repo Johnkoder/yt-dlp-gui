@@ -33,10 +33,35 @@ function activeListen() {
   return unlistens;
 }
 
+export const TEST_DOWNLOADS_DIR = "C:\\Users\\Test\\Downloads";
+
+/** Route mocked invokes like the backend would answer. */
+export function mockInvokeRouting() {
+  mockInvoke.mockImplementation((command: string, args?: unknown) => {
+    if (command === "get_downloads_dir") {
+      return Promise.resolve(TEST_DOWNLOADS_DIR);
+    }
+    if (command === "validate_output_directory") {
+      const path = (args as { path: string }).path;
+      return path === "C:\\stale\\gone"
+        ? Promise.reject(new Error("gone"))
+        : Promise.resolve(path);
+    }
+    return Promise.resolve(undefined);
+  });
+}
+
 beforeEach(() => {
-  mockInvoke.mockReset().mockResolvedValue(undefined);
+  mockInvoke.mockReset();
   mockListen.mockReset();
+  window.localStorage.clear();
+  mockInvokeRouting();
 });
+
+/** Every start_download invocation (startup init also invokes). */
+function startedDownloads() {
+  return mockInvoke.mock.calls.filter(([command]) => command === "start_download");
+}
 
 describe("useDownload event readiness", () => {
   it("blocks downloads until listeners are registered", async () => {
@@ -55,7 +80,7 @@ describe("useDownload event readiness", () => {
     await act(async () => {
       await result.current.handleDownload();
     });
-    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(startedDownloads()).toHaveLength(0);
     expect(result.current.status).toBe("initializing");
   });
 
@@ -75,12 +100,13 @@ describe("useDownload event readiness", () => {
     await act(async () => {
       await result.current.handleDownload();
     });
-    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(startedDownloads()).toHaveLength(1);
     expect(mockInvoke).toHaveBeenCalledWith("start_download", {
       request: {
         url: "https://example.com/video",
         mediaType: "video",
         quality: "best",
+        outputDirectory: TEST_DOWNLOADS_DIR,
       },
     });
     expect(result.current.status).toBe("downloading");
@@ -108,7 +134,7 @@ describe("useDownload event readiness", () => {
     await act(async () => {
       await result.current.handleDownload();
     });
-    expect(mockInvoke).not.toHaveBeenCalled();
+    expect(startedDownloads()).toHaveLength(0);
   });
 
   it("unsubscribes listeners on unmount", async () => {

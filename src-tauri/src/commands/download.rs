@@ -49,9 +49,10 @@ pub async fn start_download(
     // Fail fast if the binary is missing so the user gets an immediate,
     // understandable error instead of a silent background failure.
     ytdlp::resolve_ytdlp_path(&app)?;
-    let downloads_dir = ytdlp::resolve_downloads_dir()?;
 
-    let options = ytdlp::validate_request(&request, downloads_dir)?;
+    // The output directory comes from the validated request — Downloads is
+    // only the default/fallback, never the forced destination.
+    let options = ytdlp::validate_request(&request)?;
 
     let active = state.active.clone();
     if active
@@ -69,7 +70,7 @@ pub async fn start_download(
     Ok(())
 }
 
-/// Absolute path of the user's Downloads folder (for display/testing).
+/// Absolute path of the user's Downloads folder (default output folder).
 #[tauri::command]
 pub fn get_downloads_dir() -> Result<String, String> {
     Ok(ytdlp::resolve_downloads_dir()?
@@ -77,17 +78,29 @@ pub fn get_downloads_dir() -> Result<String, String> {
         .to_string())
 }
 
-/// Open the Downloads folder with the OS file manager.
+/// Validate a candidate output directory. Used at startup to check a
+/// persisted folder and shared with the download path validation.
 #[tauri::command]
-pub fn open_downloads_folder() -> Result<(), String> {
-    let dir = ytdlp::resolve_downloads_dir()?;
+pub fn validate_output_directory(path: String) -> Result<String, String> {
+    Ok(ytdlp::validate_output_directory(&path)?
+        .to_string_lossy()
+        .to_string())
+}
+
+/// Open an output folder with the OS file manager. The path is validated
+/// and passed as a single argument — never through a shell. This command
+/// cannot execute anything: it only opens folders in Explorer.
+#[tauri::command]
+pub fn open_output_folder(path: String) -> Result<(), String> {
+    let dir = ytdlp::validate_output_directory(&path)
+        .map_err(|_| "The folder to open is no longer available.".to_string())?;
 
     #[cfg(target_os = "windows")]
     {
         std::process::Command::new("explorer")
             .arg(&dir)
             .spawn()
-            .map_err(|e| format!("Could not open Downloads folder: {}", e))?;
+            .map_err(|e| format!("Could not open folder: {}", e))?;
         Ok(())
     }
 
@@ -96,7 +109,7 @@ pub fn open_downloads_folder() -> Result<(), String> {
         std::process::Command::new("open")
             .arg(&dir)
             .spawn()
-            .map_err(|e| format!("Could not open Downloads folder: {}", e))?;
+            .map_err(|e| format!("Could not open folder: {}", e))?;
         return Ok(());
     }
 
@@ -105,7 +118,7 @@ pub fn open_downloads_folder() -> Result<(), String> {
         std::process::Command::new("xdg-open")
             .arg(&dir)
             .spawn()
-            .map_err(|e| format!("Could not open Downloads folder: {}", e))?;
+            .map_err(|e| format!("Could not open folder: {}", e))?;
         return Ok(());
     }
 }

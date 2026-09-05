@@ -1,6 +1,7 @@
 import { DownloadButton } from "./components/DownloadButton";
 import { DownloadProgress } from "./components/DownloadProgress";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
+import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
 import { StatusMessage } from "./components/StatusMessage";
 import { UrlInput } from "./components/UrlInput";
@@ -17,6 +18,8 @@ export default function App() {
     setMediaType,
     quality,
     setQuality,
+    outputDirectory,
+    chooseOutputDirectory,
     progress,
     result,
     errorMessage,
@@ -79,6 +82,12 @@ export default function App() {
           />
         )}
 
+        <OutputFolderSelector
+          value={outputDirectory}
+          onBrowse={chooseOutputDirectory}
+          disabled={optionsLocked}
+        />
+
         <DownloadButton
           disabled={!canDownload}
           loading={isDownloading || isInitializing}
@@ -109,7 +118,7 @@ export default function App() {
       </main>
 
       <footer className="app-footer">
-        <span>Files are saved to your Downloads folder.</span>
+        <span>Files are saved to your chosen output folder.</span>
       </footer>
     </div>
   );

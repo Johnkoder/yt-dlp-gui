@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  chooseOutputDirectory,
   friendlyErrorMessage,
+  getDownloadsDir,
   startDownload,
   subscribeToDownloadEvents,
+  validateOutputDirectory,
 } from "../downloadService";
 import {
   DEFAULT_MEDIA_TYPE,
@@ -11,6 +14,11 @@ import {
   type MediaType,
   type VideoQuality,
 } from "../options";
+import {
+  clearSavedOutputDirectory,
+  getSavedOutputDirectory,
+  saveOutputDirectory,
+} from "../outputDirectory";
 import type {
   DownloadError,
   DownloadProgressEvent,
@@ -28,6 +36,10 @@ export interface UseDownloadState {
   setMediaType: (mediaType: MediaType) => void;
   quality: VideoQuality;
   setQuality: (quality: VideoQuality) => void;
+  /** Resolved output folder; null until startup initialization finishes. */
+  outputDirectory: string | null;
+  setOutputDirectory: (path: string) => void;
+  chooseOutputDirectory: () => Promise<void>;
   progress: DownloadProgressEvent | null;
   result: DownloadResult | null;
   errorMessage: string | null;
@@ -38,13 +50,14 @@ export interface UseDownloadState {
 }
 
 /**
- * Owns the MVP download state machine:
+ * Owns the download state machine:
  * initializing -> ready -> downloading -> success | error.
  *
- * Downloads are gated on `subscription === "active"`, so the button can
- * never fire before every backend event listener is registered. A failed
- * subscription lands in a terminal error state that `handleReset` does not
- * clear — the app must be restarted.
+ * Downloads are gated on `subscription === "active"` AND a resolved output
+ * directory, so the button can never fire before listeners are registered
+ * or before the save location is known. A failed subscription or an
+ * undeterminable default folder lands in a terminal error state that
+ * `handleReset` does not clear — the app must be restarted.
  */
 export function useDownload(): UseDownloadState {
   const [status, setStatus] = useState<DownloadStatus>("initializing");
@@ -56,6 +69,9 @@ export function useDownload(): UseDownloadState {
     useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [quality, setQualityState] = useState<VideoQuality>(
     DEFAULT_VIDEO_QUALITY,
+  );
+  const [outputDirectory, setOutputDirectoryState] = useState<string | null>(
+    null,
   );
   const [progress, setProgress] = useState<DownloadProgressEvent | null>(null);
   const [result, setResult] = useState<DownloadResult | null>(null);
@@ -69,6 +85,20 @@ export function useDownload(): UseDownloadState {
   // error mapping never sees a stale closure value.
   const mediaTypeRef = useRef<MediaType>(DEFAULT_MEDIA_TYPE);
   mediaTypeRef.current = mediaType;
+  const outputDirectoryRef = useRef<string | null>(null);
+  outputDirectoryRef.current = outputDirectory;
+
+  // Shared gate: `initializing` ends only after event listeners AND the
+  // output folder are both resolved — in either completion order.
+  const markReadyWhenInitialized = useCallback(() => {
+    if (
+      statusRef.current === "initializing" &&
+      subscriptionRef.current === "active" &&
+      outputDirectoryRef.current !== null
+    ) {
+      setStatus("ready");
+    }
+  }, []);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -107,9 +137,8 @@ export function useDownload(): UseDownloadState {
         }
         unlisten = fn;
         setSubscription("active");
-        setStatus((current) =>
-          current === "initializing" ? "ready" : current,
-        );
+        subscriptionRef.current = "active";
+        markReadyWhenInitialized();
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -128,7 +157,56 @@ export function useDownload(): UseDownloadState {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [markReadyWhenInitialized]);
+
+  // Output-folder initialization: default Downloads, persisted override
+  // when it still validates, fatal error when no default can be found.
+  // The guarded ready-transition keeps startup flicker-free: the UI leaves
+  // `initializing` only after listeners AND the folder are both resolved.
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initialize() {
+      let fallback: string;
+      try {
+        fallback = await getDownloadsDir();
+      } catch (err: unknown) {
+        if (cancelled) return;
+        const raw = err instanceof Error ? err.message : String(err);
+        setErrorMessage(
+          "Could not determine your Downloads folder. Please restart the application.",
+        );
+        setErrorDetails(raw);
+        setStatus("error");
+        return;
+      }
+      const saved = getSavedOutputDirectory();
+      if (saved !== null) {
+        try {
+          const valid = await validateOutputDirectory(saved);
+          if (!cancelled) {
+            outputDirectoryRef.current = valid;
+            setOutputDirectoryState(valid);
+            markReadyWhenInitialized();
+          }
+          return;
+        } catch {
+          // Stale preference: drop it and fall back to Downloads.
+          clearSavedOutputDirectory();
+        }
+      }
+      if (!cancelled) {
+        outputDirectoryRef.current = fallback;
+        setOutputDirectoryState(fallback);
+        markReadyWhenInitialized();
+      }
+    }
+
+    initialize();
+    return () => {
+      cancelled = true;
+    };
+  }, [markReadyWhenInitialized]);
 
   const setUrl = useCallback((value: string) => {
     setUrlState(value);
@@ -142,16 +220,56 @@ export function useDownload(): UseDownloadState {
     setQualityState(value);
   }, []);
 
+  const setOutputDirectory = useCallback((value: string) => {
+    setOutputDirectoryState(value);
+    saveOutputDirectory(value);
+  }, []);
+
+  const handleChooseOutputDirectory = useCallback(async () => {
+    if (
+      subscriptionRef.current !== "active" ||
+      statusRef.current === "downloading"
+    ) {
+      return;
+    }
+    let selected: string | null;
+    try {
+      selected = await chooseOutputDirectory();
+    } catch (err: unknown) {
+      // The picker itself failed; keep the current folder.
+      const raw = err instanceof Error ? err.message : String(err);
+      setErrorMessage("Could not open the folder picker.");
+      setErrorDetails(raw);
+      setStatus("error");
+      return;
+    }
+    if (selected === null) {
+      // Cancelled: leave everything unchanged, silently.
+      return;
+    }
+    try {
+      const valid = await validateOutputDirectory(selected);
+      setOutputDirectoryState(valid);
+      saveOutputDirectory(valid);
+    } catch (err: unknown) {
+      const raw = err instanceof Error ? err.message : String(err);
+      setErrorMessage(friendlyErrorMessage(raw));
+      setErrorDetails(raw);
+      setStatus("error");
+    }
+  }, []);
+
   const trimmedUrl = url.trim();
   const canDownload =
     subscription === "active" &&
     status !== "downloading" &&
     status !== "initializing" &&
+    outputDirectory !== null &&
     trimmedUrl.length > 0;
 
   const handleDownload = useCallback(async () => {
     // Defense in depth: the UI disables the button, but never invoke the
-    // backend without listeners — progress/completion would be lost.
+    // backend without listeners and a resolved folder.
     if (subscriptionRef.current !== "active") {
       return;
     }
@@ -162,13 +280,19 @@ export function useDownload(): UseDownloadState {
     if (target.length === 0) {
       return;
     }
+    const destination = outputDirectoryRef.current;
+    if (destination === null) {
+      return;
+    }
     setProgress(null);
     setResult(null);
     setErrorMessage(null);
     setErrorDetails(null);
     setStatus("downloading");
     try {
-      await startDownload(buildDownloadRequest(target, mediaType, quality));
+      await startDownload(
+        buildDownloadRequest(target, mediaType, quality, destination),
+      );
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
       setErrorMessage(friendlyErrorMessage(raw, mediaType));
@@ -200,6 +324,9 @@ export function useDownload(): UseDownloadState {
     setMediaType,
     quality,
     setQuality,
+    outputDirectory,
+    setOutputDirectory,
+    chooseOutputDirectory: handleChooseOutputDirectory,
     progress,
     result,
     errorMessage,

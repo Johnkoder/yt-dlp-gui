@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { DownloadRequest, MediaType } from "./options";
 import type {
   DownloadError,
@@ -35,12 +36,35 @@ export async function startDownload(request: DownloadRequest): Promise<void> {
   });
 }
 
-export async function openDownloadsFolder(): Promise<void> {
-  await invoke("open_downloads_folder");
+export async function openOutputFolder(path: string): Promise<void> {
+  await invoke("open_output_folder", { path });
 }
 
 export async function getDownloadsDir(): Promise<string> {
   return invoke<string>("get_downloads_dir");
+}
+
+/** Backend validation shared by startup checks and new selections. */
+export async function validateOutputDirectory(path: string): Promise<string> {
+  return invoke<string>("validate_output_directory", { path });
+}
+
+/**
+ * Native folder picker (directory only, single selection).
+ * Returns the chosen folder, or `null` when the user cancels — cancellation
+ * is not an error and must leave the current selection untouched.
+ */
+export async function chooseOutputDirectory(): Promise<string | null> {
+  const selected = await openDialog({
+    directory: true,
+    multiple: false,
+    title: "Choose output folder",
+  });
+  if (selected === null) {
+    return null;
+  }
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  return path ?? null;
 }
 
 export function friendlyErrorMessage(

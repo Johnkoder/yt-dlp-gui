@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { CheckCircle2, FolderOpen, RotateCcw, XCircle } from "lucide-react";
-import { openDownloadsFolder } from "../features/downloads/downloadService";
+import { openOutputFolder } from "../features/downloads/downloadService";
 import type { DownloadResult } from "../features/downloads/types";
 import "./StatusMessage.css";
 
@@ -26,10 +26,14 @@ export function StatusMessage({
 
   const handleOpen = async () => {
     setOpenError(null);
+    if (!result?.outputDir) {
+      setOpenError("The output folder is no longer known.");
+      return;
+    }
     try {
-      await openDownloadsFolder();
+      await openOutputFolder(result.outputDir);
     } catch {
-      setOpenError("Could not open the Downloads folder.");
+      setOpenError("Could not open the output folder.");
     }
   };
 
@@ -56,8 +60,10 @@ export function StatusMessage({
             </div>
           )}
           {message && <div className="status__message">{message}</div>}
-          {kind === "success" && (
-            <div className="status__message">Saved to Downloads</div>
+          {kind === "success" && result?.outputDir && (
+            <div className="status__message status__location" title={result.outputDir}>
+              Saved to {result.outputDir}
+            </div>
           )}
         </div>
       </div>
@@ -70,7 +76,7 @@ export function StatusMessage({
         {kind === "success" && (
           <button type="button" className="btn btn--secondary" onClick={handleOpen}>
             <FolderOpen size={15} />
-            Open Downloads
+            Open Folder
           </button>
         )}
         {onReset && (
