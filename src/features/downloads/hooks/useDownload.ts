@@ -65,6 +65,10 @@ export function useDownload(): UseDownloadState {
   statusRef.current = status;
   const subscriptionRef = useRef<EventSubscription>("pending");
   subscriptionRef.current = subscription;
+  // The event handlers are registered once; read the mode through a ref so
+  // error mapping never sees a stale closure value.
+  const mediaTypeRef = useRef<MediaType>(DEFAULT_MEDIA_TYPE);
+  mediaTypeRef.current = mediaType;
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -87,7 +91,9 @@ export function useDownload(): UseDownloadState {
       },
       onError: (payload: DownloadError) => {
         if (cancelled) return;
-        setErrorMessage(friendlyErrorMessage(payload.message));
+        setErrorMessage(
+          friendlyErrorMessage(payload.message, mediaTypeRef.current),
+        );
         setErrorDetails(payload.details ?? payload.message);
         setStatus("error");
       },
@@ -165,7 +171,7 @@ export function useDownload(): UseDownloadState {
       await startDownload(buildDownloadRequest(target, mediaType, quality));
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
-      setErrorMessage(friendlyErrorMessage(raw));
+      setErrorMessage(friendlyErrorMessage(raw, mediaType));
       setErrorDetails(raw);
       setStatus("error");
     }

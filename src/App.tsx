@@ -109,7 +109,7 @@ export default function App() {
       </main>
 
       <footer className="app-footer">
-        <span>Videos are saved to your Downloads folder.</span>
+        <span>Files are saved to your Downloads folder.</span>
       </footer>
     </div>
   );

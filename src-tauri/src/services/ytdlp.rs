@@ -262,9 +262,11 @@ pub fn resolve_downloads_dir() -> Result<PathBuf, String> {
 /// raw format expression. No exact format IDs, no site-specific IDs.
 pub fn format_selector(media_type: MediaType, quality: Option<VideoQuality>) -> String {
     match media_type {
-        // Best native audio stream in its source container/codec. No `-x`,
-        // no mp3 conversion: conversion needs FFmpeg and is a later phase.
-        MediaType::Audio => "ba/b".to_string(),
+        // Best audio-ONLY stream in its source container/codec. Deliberately
+        // no `/b` fallback: falling back to a combined video+audio format
+        // would silently break the "Download Audio" promise. No `-x`, no mp3
+        // conversion: conversion needs FFmpeg and is a later phase.
+        MediaType::Audio => "ba".to_string(),
         MediaType::Video => match quality.unwrap_or(VideoQuality::Best) {
             VideoQuality::Best => "bv*+ba/b".to_string(),
             preset => {
@@ -867,8 +869,14 @@ mod tests {
         );
         let args = build_download_args(&options);
         let format = format_value(&args);
-        // Best native audio stream; never a conversion flag.
-        assert_eq!(format, "ba/b");
+        // Best audio-ONLY stream: exactly `ba`, never a `/b` fallback to a
+        // combined video+audio format, and never a conversion flag.
+        assert_eq!(format, "ba");
+        assert!(
+            !format.contains('/'),
+            "audio selector must not fall back to video, got: {}",
+            format
+        );
         assert!(
             !args.iter().any(|a| a == "-x"
                 || a == "--extract-audio"
@@ -903,11 +911,11 @@ mod tests {
             format_selector(MediaType::Video, Some(VideoQuality::P720)),
             "bv*[height<=720]+ba/b[height<=720]"
         );
-        assert_eq!(format_selector(MediaType::Audio, None), "ba/b");
+        assert_eq!(format_selector(MediaType::Audio, None), "ba");
         // Even a stray quality with audio resolves to plain best audio.
         assert_eq!(
             format_selector(MediaType::Audio, Some(VideoQuality::P1080)),
-            "ba/b"
+            "ba"
         );
     }
 

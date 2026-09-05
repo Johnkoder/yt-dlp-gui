@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { DownloadRequest } from "./options";
+import type { DownloadRequest, MediaType } from "./options";
 import type {
   DownloadError,
   DownloadProgressEvent,
@@ -43,7 +43,10 @@ export async function getDownloadsDir(): Promise<string> {
   return invoke<string>("get_downloads_dir");
 }
 
-export function friendlyErrorMessage(raw: string): string {
+export function friendlyErrorMessage(
+  raw: string,
+  mediaType?: MediaType,
+): string {
   const lower = raw.toLowerCase();
   if (
     lower.includes("ffmpeg") &&
@@ -58,7 +61,9 @@ export function friendlyErrorMessage(raw: string): string {
     lower.includes("no video formats found") ||
     lower.includes("no audio formats found")
   ) {
-    return "The requested quality is not available for this video. Try Best quality.";
+    return mediaType === "audio"
+      ? "No audio-only format is available for this URL."
+      : "The requested quality is not available for this video. Try Best quality.";
   }
   if (
     lower.includes("unsupported url") ||

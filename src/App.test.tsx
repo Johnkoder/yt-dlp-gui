@@ -87,6 +87,22 @@ describe("App download options", () => {
     ).toBeEnabled();
   });
 
+  it("moves selection and focus together with arrow keys", async () => {
+    await renderReadyApp();
+
+    const video = screen.getByRole("radio", { name: "Video" });
+    const audio = screen.getByRole("radio", { name: "Audio" });
+
+    video.focus();
+    fireEvent.keyDown(video, { key: "ArrowRight" });
+    expect(audio).toHaveAttribute("aria-checked", "true");
+    expect(document.activeElement).toBe(audio);
+
+    fireEvent.keyDown(audio, { key: "ArrowLeft" });
+    expect(video).toHaveAttribute("aria-checked", "true");
+    expect(document.activeElement).toBe(video);
+  });
+
   it("sends the selected video quality to the backend", async () => {
     await renderReadyApp();
 

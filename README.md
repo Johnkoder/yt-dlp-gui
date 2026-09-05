@@ -11,9 +11,11 @@ the `yt-dlp.exe` binary, which is bundled as an application resource.
 ## Current features
 
 - Paste a video URL and download it with one click (Enter works too)
-- Download type: **Video** or native **Audio** (best source audio stream,
-  kept in its original container such as `.m4a`/`.webm` — MP3 conversion
-  is not implemented yet)
+- Download type: **Video** or **Audio**. Audio downloads the best
+  available **audio-only** stream and keeps the native source
+  container/codec (such as `.m4a`/`.webm`); it never falls back to a
+  video file, does not convert to MP3 yet, and fails with an
+  understandable error when no audio-only format exists
 - Video quality presets: **Best / 2160p / 1440p / 1080p / 720p / 480p /
   360p** (best stream at or below the chosen height, plus best audio,
   with a fallback when separate streams are unavailable)
