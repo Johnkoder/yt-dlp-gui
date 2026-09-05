@@ -9,7 +9,9 @@ rust-version = "1.88"
 
 [lib]
 name = "yt_dlp_gui_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# rlib only: this is a Windows desktop binary, not a mobile cdylib. The
+# staticlib/cdylib types previously forced a DLL link that the GNU
+# toolchain cannot complete (export ordinal overflow on WebView2 symbols).
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
