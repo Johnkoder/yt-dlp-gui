@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { DownloadRequest, MediaType } from "./options";
 import type {
+  DownloadCancelled,
   DownloadError,
   DownloadProgressEvent,
   DownloadResult,
@@ -11,11 +12,13 @@ import type {
 export const DOWNLOAD_PROGRESS_EVENT = "download-progress";
 export const DOWNLOAD_COMPLETE_EVENT = "download-complete";
 export const DOWNLOAD_ERROR_EVENT = "download-error";
+export const DOWNLOAD_CANCELLED_EVENT = "download-cancelled";
 
 export interface DownloadEventHandlers {
   onProgress: (progress: DownloadProgressEvent) => void;
   onComplete: (result: DownloadResult) => void;
   onError: (error: DownloadError) => void;
+  onCancelled: (event: DownloadCancelled) => void;
 }
 
 /**
@@ -159,6 +162,15 @@ export function friendlyErrorMessage(
 }
 
 /**
+ * Request cancellation of the active download. Returns true when a
+ * cancellation request reached an active download, false when nothing was
+ * running. No PIDs or process details cross IPC — the backend owns them.
+ */
+export async function cancelDownload(): Promise<boolean> {
+  return invoke<boolean>("cancel_download");
+}
+
+/**
  * Subscribe to backend download events. Returns an unlisten function.
  *
  * Registration is transactional: if any listener fails to register, the
@@ -187,6 +199,12 @@ export async function subscribeToDownloadEvents(
       await listen<DownloadError>(
         DOWNLOAD_ERROR_EVENT,
         (event) => handlers.onError(event.payload),
+      ),
+    );
+    unlisteners.push(
+      await listen<DownloadCancelled>(
+        DOWNLOAD_CANCELLED_EVENT,
+        (event) => handlers.onCancelled(event.payload),
       ),
     );
   } catch (error) {

@@ -27,6 +27,10 @@
   );
 }
 
+.status--cancelled {
+  border-color: var(--border-default);
+}
+
 .status__row {
   display: flex;
   gap: 10px;
@@ -44,6 +48,10 @@
 
 .status__icon--error {
   color: var(--error);
+}
+
+.status__icon--cancelled {
+  color: var(--text-secondary);
 }
 
 .status__text {

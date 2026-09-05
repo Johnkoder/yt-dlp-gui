@@ -1,11 +1,12 @@
 import { useEffect } from "react";
+import { AudioFormatSelector } from "./components/AudioFormatSelector";
+import { CancelButton } from "./components/CancelButton";
 import { DependencySection } from "./components/DependencySection";
 import { DownloadButton } from "./components/DownloadButton";
 import { DownloadProgress } from "./components/DownloadProgress";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
 import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
-import { AudioFormatSelector } from "./components/AudioFormatSelector";
 import { StatusMessage } from "./components/StatusMessage";
 import { UrlInput } from "./components/UrlInput";
 import { AUDIO_FORMAT_LABELS } from "./features/downloads/options";
@@ -31,8 +32,10 @@ export default function App() {
     result,
     errorMessage,
     errorDetails,
+    cancelError,
     canDownload,
     handleDownload,
+    handleCancel,
     handleReset,
   } = useDownload();
 
@@ -40,8 +43,9 @@ export default function App() {
 
   const isInitializing = status === "initializing";
   const isDownloading = status === "downloading";
+  const isCancelling = status === "cancelling";
   const backendUnreachable = subscription === "failed";
-  const optionsLocked = isDownloading || isInitializing;
+  const optionsLocked = isDownloading || isCancelling || isInitializing;
   const isAudio = mediaType === "audio";
   // Only yt-dlp gates downloads; Deno/FFmpeg degrade gracefully —
   // except an audio conversion, which needs FFmpeg confirmed available.
@@ -167,11 +171,35 @@ export default function App() {
 
         {isDownloading && <DownloadProgress progress={progress} />}
 
+        {(isDownloading || isCancelling) && (
+          <CancelButton
+            cancelling={isCancelling}
+            onClick={() => {
+              void handleCancel();
+            }}
+          />
+        )}
+
+        {cancelError && (isDownloading || isCancelling) && (
+          <p className="hint hint--error" role="alert">
+            {cancelError}
+          </p>
+        )}
+
         {status === "success" && result && (
           <StatusMessage
             kind="success"
             title="Download complete"
             result={result}
+            onReset={handleReset}
+          />
+        )}
+
+        {status === "cancelled" && (
+          <StatusMessage
+            kind="cancelled"
+            title="Download cancelled"
+            message="The download was stopped."
             onReset={handleReset}
           />
         )}

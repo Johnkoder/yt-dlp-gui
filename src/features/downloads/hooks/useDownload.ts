@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  cancelDownload,
   chooseOutputDirectory,
   friendlyErrorMessage,
   getDownloadsDir,
@@ -48,14 +49,18 @@ export interface UseDownloadState {
   result: DownloadResult | null;
   errorMessage: string | null;
   errorDetails: string | null;
+  /** Cancellation-specific failure; the download itself keeps running. */
+  cancelError: string | null;
   canDownload: boolean;
   handleDownload: () => Promise<void>;
+  handleCancel: () => Promise<void>;
   handleReset: () => void;
 }
 
 /**
  * Owns the download state machine:
- * initializing -> ready -> downloading -> success | error.
+ * initializing -> ready -> downloading -> success | error, plus the neutral
+ * downloading -> cancelling -> cancelled branch.
  *
  * Downloads are gated on `subscription === "active"` AND a resolved output
  * directory, so the button can never fire before listeners are registered
@@ -85,6 +90,7 @@ export function useDownload(): UseDownloadState {
   const [result, setResult] = useState<DownloadResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [errorDetails, setErrorDetails] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const statusRef = useRef<DownloadStatus>("initializing");
   statusRef.current = status;
   const subscriptionRef = useRef<EventSubscription>("pending");
@@ -115,8 +121,18 @@ export function useDownload(): UseDownloadState {
     subscribeToDownloadEvents({
       onProgress: (payload) => {
         if (cancelled) return;
+        const current = statusRef.current;
+        if (
+          current === "success" ||
+          current === "error" ||
+          current === "cancelled"
+        ) {
+          return;
+        }
+        // While cancelling the numbers may still update, but the lifecycle
+        // status must never regress back to downloading.
         setProgress(payload);
-        if (statusRef.current !== "downloading") {
+        if (current !== "downloading" && current !== "cancelling") {
           setStatus("downloading");
         }
       },
@@ -125,6 +141,7 @@ export function useDownload(): UseDownloadState {
         setResult(payload);
         setErrorMessage(null);
         setErrorDetails(null);
+        setCancelError(null);
         setStatus("success");
       },
       onError: (payload: DownloadError) => {
@@ -134,6 +151,13 @@ export function useDownload(): UseDownloadState {
         );
         setErrorDetails(payload.details ?? payload.message);
         setStatus("error");
+      },
+      onCancelled: () => {
+        if (cancelled) return;
+        setErrorMessage(null);
+        setErrorDetails(null);
+        setCancelError(null);
+        setStatus("cancelled");
       },
     })
       .then((fn) => {
@@ -275,6 +299,7 @@ export function useDownload(): UseDownloadState {
   const canDownload =
     subscription === "active" &&
     status !== "downloading" &&
+    status !== "cancelling" &&
     status !== "initializing" &&
     outputDirectory !== null &&
     trimmedUrl.length > 0;
@@ -285,7 +310,10 @@ export function useDownload(): UseDownloadState {
     if (subscriptionRef.current !== "active") {
       return;
     }
-    if (statusRef.current === "downloading") {
+    if (
+      statusRef.current === "downloading" ||
+      statusRef.current === "cancelling"
+    ) {
       return;
     }
     const target = url.trim();
@@ -300,6 +328,7 @@ export function useDownload(): UseDownloadState {
     setResult(null);
     setErrorMessage(null);
     setErrorDetails(null);
+    setCancelError(null);
     setStatus("downloading");
     try {
       await startDownload(
@@ -319,9 +348,40 @@ export function useDownload(): UseDownloadState {
     }
   }, [url, mediaType, quality, audioFormat]);
 
+  const handleCancel = useCallback(async () => {
+    // Only a running download can be cancelled; anything else is a no-op
+    // (this also makes double-clicks harmless).
+    if (
+      subscriptionRef.current !== "active" ||
+      statusRef.current !== "downloading"
+    ) {
+      return;
+    }
+    setCancelError(null);
+    setStatus("cancelling");
+    try {
+      await cancelDownload();
+      // The backend confirms via the download-cancelled event; `cancelled`
+      // is set there, never here, so a lost signal can't fake the outcome.
+    } catch (err: unknown) {
+      // The IPC call itself failed — the download may still be running, so
+      // return to `downloading` and keep it visible instead of erroring out.
+      const raw = err instanceof Error ? err.message : String(err);
+      setCancelError(`Could not cancel the download. ${raw}`);
+      // Re-read the live ref (a terminal backend event may have moved the
+      // lifecycle meanwhile); the cast defeats stale narrowing on purpose.
+      // "downloading" covers a transition render that hasn't flushed yet.
+      const current = statusRef.current as DownloadStatus;
+      if (current === "cancelling" || current === "downloading") {
+        setStatus("downloading");
+      }
+    }
+  }, []);
+
   const handleReset = useCallback(() => {
     if (
       statusRef.current === "downloading" ||
+      statusRef.current === "cancelling" ||
       subscriptionRef.current !== "active"
     ) {
       return;
@@ -330,6 +390,7 @@ export function useDownload(): UseDownloadState {
     setResult(null);
     setErrorMessage(null);
     setErrorDetails(null);
+    setCancelError(null);
     setStatus("ready");
   }, []);
 
@@ -351,8 +412,10 @@ export function useDownload(): UseDownloadState {
     result,
     errorMessage,
     errorDetails,
+    cancelError,
     canDownload,
     handleDownload,
+    handleCancel,
     handleReset,
   };
 }

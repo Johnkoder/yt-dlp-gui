@@ -3,12 +3,15 @@
 /**
  * UI state machine. `initializing` lasts until all backend event listeners
  * are registered; downloads are only allowed from `ready` (or a completed
- * state with an active subscription).
+ * state with an active subscription). Cancellation is its own neutral
+ * branch — never an error.
  */
 export type DownloadStatus =
   | "initializing"
   | "ready"
   | "downloading"
+  | "cancelling"
+  | "cancelled"
   | "success"
   | "error";
 
@@ -47,4 +50,8 @@ export interface DownloadError {
   message: string;
   /** Truncated stderr tail for display. */
   details?: string | null;
+}
+
+export interface DownloadCancelled {
+  message: string;
 }

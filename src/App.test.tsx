@@ -81,6 +81,7 @@ function activeListen() {
   mockListen
     .mockResolvedValueOnce(vi.fn())
     .mockResolvedValueOnce(vi.fn())
+    .mockResolvedValueOnce(vi.fn())
     .mockResolvedValueOnce(vi.fn());
 }
 
@@ -635,5 +636,153 @@ describe("App audio formats", () => {
     await act(async () => {});
 
     expect(screen.getByLabelText("Audio format")).toBeDisabled();
+  });
+});
+
+describe("App cancellation", () => {
+  /** Render with pending start_download; returns captured event handlers. */
+  async function renderDownloadingApp() {
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "check_dependencies") {
+        return Promise.resolve(availableReport());
+      }
+      if (command === "get_downloads_dir") {
+        return Promise.resolve(DEFAULT_DIR);
+      }
+      if (command === "validate_output_directory") {
+        return Promise.resolve((args as { path: string }).path);
+      }
+      return new Promise(() => {});
+    });
+    const handlers = new Map<string, (payload: never) => void>();
+    mockListen.mockImplementation((event: string, handler: (p: never) => void) => {
+      handlers.set(event, handler);
+      return Promise.resolve(vi.fn());
+    });
+    render(<App />);
+    await act(async () => {});
+
+    fireEvent.change(screen.getByPlaceholderText(/youtube\.com/), {
+      target: { value: "https://example.com/v" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /download video/i }));
+    await act(async () => {});
+    return handlers;
+  }
+
+  function cancelRequests() {
+    return mockInvoke.mock.calls.filter(
+      ([command]) => command === "cancel_download",
+    );
+  }
+
+  it("shows no Cancel button when ready", async () => {
+    await renderReadyApp();
+    expect(
+      screen.queryByRole("button", { name: /^cancel$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows an enabled Cancel button while downloading", async () => {
+    await renderDownloadingApp();
+    expect(screen.getByRole("button", { name: /^cancel$/i })).toBeEnabled();
+  });
+
+  it("cancel flows to a neutral Cancelled state, never Download failed", async () => {
+    const handlers = await renderDownloadingApp();
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await act(async () => {});
+    expect(cancelRequests()).toHaveLength(1);
+    expect(
+      screen.getByRole("button", { name: /cancelling/i }),
+    ).toBeDisabled();
+
+    await act(async () => {
+      handlers.get("download-cancelled")?.({
+        payload: { message: "Download cancelled." },
+      } as never);
+    });
+    expect(screen.getByText("Download cancelled")).toBeInTheDocument();
+    expect(screen.getByText("The download was stopped.")).toBeInTheDocument();
+    expect(screen.queryByText("Download failed")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^cancel$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("Download another returns to ready with selections preserved", async () => {
+    const handlers = await renderDownloadingApp();
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await act(async () => {});
+    await act(async () => {
+      handlers.get("download-cancelled")?.({
+        payload: { message: "Download cancelled." },
+      } as never);
+    });
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /download another/i }),
+    );
+    expect(
+      screen.getByRole("button", { name: /download video/i }),
+    ).toBeEnabled();
+    expect(
+      (screen.getByPlaceholderText(/youtube\.com/) as HTMLInputElement).value,
+    ).toBe("https://example.com/v");
+  });
+
+  it("controls stay locked while cancelling", async () => {
+    await renderDownloadingApp();
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await act(async () => {});
+
+    expect(screen.getByPlaceholderText(/youtube\.com/)).toBeDisabled();
+    expect(screen.getByRole("radio", { name: "Video" })).toBeDisabled();
+    expect(screen.getByLabelText("Quality")).toBeDisabled();
+    expect(screen.getByLabelText("Output folder")).toBeDisabled();
+    expect(screen.getByRole("button", { name: /browse/i })).toBeDisabled();
+  });
+
+  it("second cancel click issues no further request", async () => {
+    await renderDownloadingApp();
+
+    const cancel = screen.getByRole("button", { name: /^cancel$/i });
+    fireEvent.click(cancel);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole("button", { name: /cancelling/i }));
+    await act(async () => {});
+    expect(cancelRequests()).toHaveLength(1);
+  });
+
+  it("cancel IPC failure keeps the download running", async () => {
+    const handlers = await renderDownloadingApp();
+    mockInvoke.mockImplementation((command: string, args?: unknown) => {
+      if (command === "cancel_download") {
+        return Promise.reject(new Error("ipc down"));
+      }
+      return defaultAnswer(command, args);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+    await act(async () => {});
+
+    // Back to downloading: progress card still shown, targeted message out.
+    expect(screen.getByText(/could not cancel the download/i)).toBeInTheDocument();
+    expect(screen.queryByText("Download failed")).not.toBeInTheDocument();
+
+    // The still-running download can still complete normally afterwards.
+    await act(async () => {
+      handlers.get("download-complete")?.({
+        payload: {
+          filename: "video [abc].mp4",
+          filepath: `${DEFAULT_DIR}\\video [abc].mp4`,
+          outputDir: DEFAULT_DIR,
+        },
+      } as never);
+    });
+    expect(screen.getByText("Download complete")).toBeInTheDocument();
   });
 });

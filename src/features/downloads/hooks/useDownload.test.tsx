@@ -25,12 +25,27 @@ function pendingListen() {
 }
 
 function activeListen() {
-  const unlistens = [vi.fn(), vi.fn(), vi.fn()];
+  const unlistens = [vi.fn(), vi.fn(), vi.fn(), vi.fn()];
   mockListen
     .mockResolvedValueOnce(unlistens[0])
     .mockResolvedValueOnce(unlistens[1])
-    .mockResolvedValueOnce(unlistens[2]);
+    .mockResolvedValueOnce(unlistens[2])
+    .mockResolvedValueOnce(unlistens[3]);
   return unlistens;
+}
+
+/** Listeners that both resolve (active subscription) and stay invokable. */
+function capturedActiveListen() {
+  const handlers = new Map<string, Handler>();
+  const unlistens = [vi.fn(), vi.fn(), vi.fn(), vi.fn()];
+  let next = 0;
+  mockListen.mockImplementation((event: string, handler: Handler) => {
+    handlers.set(event, handler);
+    const unlisten = unlistens[next] ?? vi.fn();
+    next += 1;
+    return Promise.resolve(unlisten);
+  });
+  return { handlers, unlistens };
 }
 
 export const TEST_DOWNLOADS_DIR = "C:\\Users\\Test\\Downloads";
@@ -147,5 +162,140 @@ describe("useDownload event readiness", () => {
     for (const unlisten of unlistens) {
       expect(unlisten).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("cancel requests confirmation through the backend event", async () => {
+    const { handlers } = capturedActiveListen();
+    const { result } = renderHook(() => useDownload());
+
+    await act(async () => {});
+    act(() => {
+      result.current.setUrl("https://example.com/video");
+    });
+    await act(async () => {
+      await result.current.handleDownload();
+    });
+    expect(result.current.status).toBe("downloading");
+
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    // Cancelling, not yet cancelled: the event decides.
+    expect(result.current.status).toBe("cancelling");
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_download");
+
+    await act(async () => {
+      handlers.get("download-cancelled")?.({ payload: { message: "x" } } as never);
+    });
+    expect(result.current.status).toBe("cancelled");
+    expect(result.current.result).toBeNull();
+    expect(result.current.errorMessage).toBeNull();
+  });
+
+  it("late progress does not regress cancelling to downloading", async () => {
+    const { handlers } = capturedActiveListen();
+    const { result } = renderHook(() => useDownload());
+
+    await act(async () => {});
+    act(() => {
+      result.current.setUrl("https://example.com/video");
+    });
+    await act(async () => {
+      await result.current.handleDownload();
+    });
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    expect(result.current.status).toBe("cancelling");
+
+    await act(async () => {
+      handlers.get("download-progress")?.({
+        payload: { status: "Downloading", percentage: 68 },
+      } as never);
+    });
+    expect(result.current.status).toBe("cancelling");
+    expect(result.current.progress?.percentage).toBe(68);
+  });
+
+  it("second cancel click issues no further request", async () => {
+    capturedActiveListen();
+    const { result } = renderHook(() => useDownload());
+
+    await act(async () => {});
+    act(() => {
+      result.current.setUrl("https://example.com/video");
+    });
+    await act(async () => {
+      await result.current.handleDownload();
+    });
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    const cancels = mockInvoke.mock.calls.filter(
+      ([command]) => command === "cancel_download",
+    );
+    expect(cancels).toHaveLength(1);
+    expect(result.current.status).toBe("cancelling");
+  });
+
+  it("cancel IPC failure keeps the running download visible", async () => {
+    capturedActiveListen();
+    const { result } = renderHook(() => useDownload());
+
+    await act(async () => {});
+    act(() => {
+      result.current.setUrl("https://example.com/video");
+    });
+    await act(async () => {
+      await result.current.handleDownload();
+    });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "cancel_download") {
+        return Promise.reject(new Error("ipc down"));
+      }
+      if (command === "get_downloads_dir") {
+        return Promise.resolve(TEST_DOWNLOADS_DIR);
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    // Back to downloading with a targeted message — not a fake terminal.
+    expect(result.current.status).toBe("downloading");
+    expect(result.current.cancelError).toMatch(/could not cancel/i);
+    expect(result.current.errorMessage).toBeNull();
+  });
+
+  it("reset after cancellation returns to ready with selections kept", async () => {
+    const { handlers } = capturedActiveListen();
+    const { result } = renderHook(() => useDownload());
+
+    await act(async () => {});
+    act(() => {
+      result.current.setUrl("https://example.com/video");
+      result.current.setMediaType("audio");
+    });
+    await act(async () => {
+      await result.current.handleDownload();
+    });
+    await act(async () => {
+      await result.current.handleCancel();
+    });
+    await act(async () => {
+      handlers.get("download-cancelled")?.({ payload: { message: "x" } } as never);
+    });
+    expect(result.current.status).toBe("cancelled");
+
+    act(() => {
+      result.current.handleReset();
+    });
+    expect(result.current.status).toBe("ready");
+    expect(result.current.url).toBe("https://example.com/video");
+    expect(result.current.mediaType).toBe("audio");
   });
 });

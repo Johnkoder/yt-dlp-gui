@@ -33,6 +33,10 @@ tool yt-dlp uses for merging separate streams and future conversion.
   FFmpeg produces an understandable error, never a fake file
 - Clear success state with an **Open Folder** button that opens the
   actual folder the download went to
+- Active downloads can be cancelled: the yt-dlp job (including any
+  FFmpeg child on Windows) is terminated and cancellation is reported
+  as its own neutral state, not an error. Cancelling may leave a
+  resumable partial (`.part`) file behind
 - Dependency detection with Refresh: bundled yt-dlp version, system
   Deno status, system FFmpeg status (with ffprobe note)
 - Understandable errors (bad URL, unavailable/private video, unavailable
@@ -94,10 +98,10 @@ yt-dlp-gui/
 │   ├── components/            # UrlInput, DownloadButton,
 │   │                          # DownloadProgress, StatusMessage,
 │   │                          # MediaTypeSelector, QualitySelector,
-│   │                          # AudioFormatSelector,
+│   │                          # AudioFormatSelector, CancelButton,
 │   │                          # OutputFolderSelector, DependencySection
 │   ├── features/downloads/
-│   │   ├── hooks/useDownload.ts   # initializing|ready|downloading|success|error
+│   │   ├── hooks/useDownload.ts   # initializing|ready|…|cancelled machine
 │   │   ├── downloadService.ts     # Tauri invoke/listen/dialog wrapper + errors
 │   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
 │   │   ├── outputDirectory.ts     # output-folder preference persistence
@@ -112,7 +116,7 @@ yt-dlp-gui/
 ├── src-tauri/
 │   ├── src/
 │   │   ├── commands/
-│   │   │   ├── download.rs        # start_download, dirs, open_output_folder
+│   │   │   ├── download.rs        # start/cancel_download, dirs, open_output_folder
 │   │   │   └── dependencies.rs    # check_dependencies
 │   │   ├── services/
 │   │   │   ├── ytdlp.rs           # binary resolver, argv builder,
@@ -225,11 +229,12 @@ Completed:
 - output folder selection (native picker, remembered, safe fallback)
 - dependency detection (bundled yt-dlp, system Deno, system FFmpeg)
 - audio format conversion (Original/MP3/M4A/WAV/FLAC via FFmpeg)
+- cancellation (terminates the yt-dlp job tree, neutral Cancelled state)
 
 Possible next:
-- cancellation
 - download queue
 - playlist support
+- history
 etc.
 
 ## License

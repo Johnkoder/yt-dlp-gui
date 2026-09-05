@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DOWNLOAD_CANCELLED_EVENT,
   DOWNLOAD_COMPLETE_EVENT,
   DOWNLOAD_ERROR_EVENT,
   DOWNLOAD_PROGRESS_EVENT,
@@ -19,6 +20,7 @@ const handlers = {
   onProgress: vi.fn(),
   onComplete: vi.fn(),
   onError: vi.fn(),
+  onCancelled: vi.fn(),
 };
 
 beforeEach(() => {
@@ -26,6 +28,7 @@ beforeEach(() => {
   handlers.onProgress.mockClear();
   handlers.onComplete.mockClear();
   handlers.onError.mockClear();
+  handlers.onCancelled.mockClear();
 });
 
 describe("subscribeToDownloadEvents", () => {
@@ -72,12 +75,34 @@ describe("subscribeToDownloadEvents", () => {
     );
   });
 
-  it("unregisters all three listeners on cleanup", async () => {
+  it("rolls back all three listeners when the fourth fails", async () => {
     const unlistens = [vi.fn(), vi.fn(), vi.fn()];
     mockListen
       .mockResolvedValueOnce(unlistens[0])
       .mockResolvedValueOnce(unlistens[1])
-      .mockResolvedValueOnce(unlistens[2]);
+      .mockResolvedValueOnce(unlistens[2])
+      .mockRejectedValueOnce(new Error("cancelled listen failed"));
+
+    await expect(subscribeToDownloadEvents(handlers)).rejects.toThrow(
+      "cancelled listen failed",
+    );
+    for (const unlisten of unlistens) {
+      expect(unlisten).toHaveBeenCalledTimes(1);
+    }
+    expect(mockListen).toHaveBeenNthCalledWith(
+      4,
+      DOWNLOAD_CANCELLED_EVENT,
+      expect.any(Function),
+    );
+  });
+
+  it("unregisters all four listeners on cleanup", async () => {
+    const unlistens = [vi.fn(), vi.fn(), vi.fn(), vi.fn()];
+    mockListen
+      .mockResolvedValueOnce(unlistens[0])
+      .mockResolvedValueOnce(unlistens[1])
+      .mockResolvedValueOnce(unlistens[2])
+      .mockResolvedValueOnce(unlistens[3]);
 
     const cleanup = await subscribeToDownloadEvents(handlers);
     for (const unlisten of unlistens) {
@@ -91,11 +116,12 @@ describe("subscribeToDownloadEvents", () => {
   });
 
   it("cleanup is idempotent", async () => {
-    const unlistens = [vi.fn(), vi.fn(), vi.fn()];
+    const unlistens = [vi.fn(), vi.fn(), vi.fn(), vi.fn()];
     mockListen
       .mockResolvedValueOnce(unlistens[0])
       .mockResolvedValueOnce(unlistens[1])
-      .mockResolvedValueOnce(unlistens[2]);
+      .mockResolvedValueOnce(unlistens[2])
+      .mockResolvedValueOnce(unlistens[3]);
 
     const cleanup = await subscribeToDownloadEvents(handlers);
     cleanup();

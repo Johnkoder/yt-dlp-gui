@@ -12,12 +12,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     OnceLock,
 };
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::watch;
 
 pub const PROGRESS_EVENT: &str = "download-progress";
 pub const COMPLETE_EVENT: &str = "download-complete";
 pub const ERROR_EVENT: &str = "download-error";
+pub const CANCELLED_EVENT: &str = "download-cancelled";
 
 const BINARY_FILE_NAME: &str = "yt-dlp.exe";
 
@@ -280,6 +283,14 @@ pub struct DownloadResult {
 pub struct DownloadError {
     pub message: String,
     pub details: Option<String>,
+}
+
+/// Dedicated cancellation payload. Cancellation is a terminal outcome of
+/// its own — never an error and never a result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadCancelled {
+    pub message: String,
 }
 
 /// Locate the yt-dlp executable.
@@ -664,9 +675,88 @@ fn emit_error(app: &AppHandle, error: &DownloadError) {
     let _ = app.emit(ERROR_EVENT, error);
 }
 
+fn emit_cancelled(app: &AppHandle) {
+    let _ = app.emit(
+        CANCELLED_EVENT,
+        DownloadCancelled {
+            message: "Download cancelled.".to_string(),
+        },
+    );
+}
+
+/// Resolve when cancellation is requested. Level-triggered: returns
+/// immediately if already requested (early signals are never lost),
+/// otherwise wakes the moment the flag flips — no polling.
+async fn wait_for_cancel(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    let _ = rx.wait_for(|cancelled| *cancelled).await;
+}
+
+/// Exact argv for tree-terminating one PID on Windows. Pure construction so
+/// tests pin it down: never a shell string, never `/IM <name>` (which could
+/// kill unrelated processes) — always scoped to THIS download's PID.
+#[cfg(target_os = "windows")]
+fn taskkill_argv(pid: u32) -> Vec<String> {
+    vec![
+        "taskkill.exe".to_string(),
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ]
+}
+
+/// Force-terminate a PID with its descendant tree on Windows, via a direct
+/// taskkill invocation (separate argv elements, stdio silenced, bounded
+/// wait). Best effort: failure just falls through to the caller's fallback.
+#[cfg(target_os = "windows")]
+async fn kill_process_tree(pid: u32) {
+    let argv = taskkill_argv(pid);
+    let spawned = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn();
+    if let Ok(mut killer) = spawned {
+        let _ = tokio::time::timeout(Duration::from_secs(5), killer.wait()).await;
+    }
+}
+
+/// Terminate the download's process tree. Windows: PID-scoped
+/// `taskkill /T /F` (descendants like FFmpeg die too), then reap. Other
+/// targets: direct child kill. Never panics; a missing/already-exited
+/// process is simply nothing to do.
+async fn terminate_child_tree(child: &mut tokio::process::Child, pid: Option<u32>) {
+    #[cfg(target_os = "windows")]
+    if let Some(pid) = pid {
+        kill_process_tree(pid).await;
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = pid;
+    // Belt and suspenders: if anything is still running (taskkill missing
+    // or failed, non-Windows target), kill the direct child. Exited
+    // processes make this a harmless no-op error.
+    let still_running = child
+        .try_wait()
+        .map(|status| status.is_none())
+        .unwrap_or(true);
+    if still_running {
+        let _ = child.kill().await;
+    }
+}
+
 /// Run one download to completion, streaming progress events.
 /// Intended to be spawned as a background task by the command layer.
-pub async fn run_download(app: AppHandle, options: DownloadOptions) {
+/// Emits exactly one terminal event per run: complete, error, OR cancelled.
+pub async fn run_download(
+    app: AppHandle,
+    options: DownloadOptions,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
     let binary = match resolve_ytdlp_path(&app) {
         Ok(path) => path,
         Err(message) => {
@@ -684,6 +774,14 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
     let output_dir = options.output_directory.clone();
     let final_path_file = final_path_sidecar();
     let args = build_download_args(&options, &final_path_file);
+
+    // Immediate-cancel: a request that arrived before the process spawned
+    // is honored by never launching at all. (If it arrives a moment later,
+    // the select below terminates the fresh child at once instead.)
+    if *cancel_rx.borrow() {
+        emit_cancelled(&app);
+        return;
+    }
 
     let mut command = tokio::process::Command::new(&binary);
     // If Deno lives only at the user fallback (~/.deno/bin), the child
@@ -779,70 +877,99 @@ pub async fn run_download(app: AppHandle, options: DownloadOptions) {
         tail.join("\n")
     });
 
-    let status = child.wait().await;
-    // A panicked reader task must not crash the download flow: fall back to
-    // whatever was captured (or nothing) and report the exit status honestly.
-    let destination_filename = stdout_task.await.unwrap_or_default();
-    let stderr_text = stderr_task.await.unwrap_or_default();
-    // The sidecar carries the real final path (exact bytes, unlike stdout
-    // text); it is consumed and deleted here on every outcome.
-    let final_path = read_final_path_file(&final_path_file);
+    // Normal completion and cancellation race here. `biased` polls the
+    // child first, so a process that already exited reports its real
+    // outcome instead of a fake cancellation. Exactly one terminal event
+    // leaves this function: complete, error, OR cancelled — never two.
+    let pid = child.id();
+    let completion: Option<std::io::Result<std::process::ExitStatus>> = tokio::select! {
+        biased;
+        status = child.wait() => Some(status),
+        _ = wait_for_cancel(&mut cancel_rx) => {
+            terminate_child_tree(&mut child, pid).await;
+            None
+        }
+    };
 
-    match status {
-        Ok(exit) if exit.success() => {
-            match resolve_verified_result(final_path, destination_filename, &output_dir) {
-                Ok((filename, filepath)) => emit_complete(
-                    &app,
-                    &DownloadResult {
-                        filename,
-                        filepath,
-                        output_dir: output_dir.to_string_lossy().to_string(),
-                    },
-                ),
-                Err(message) => {
+    match completion {
+        Some(status) => {
+            // A panicked reader task must not crash the download flow: fall
+            // back to whatever was captured (or nothing) and report the exit
+            // status honestly.
+            let destination_filename = stdout_task.await.unwrap_or_default();
+            let stderr_text = stderr_task.await.unwrap_or_default();
+            // The sidecar carries the real final path (exact bytes, unlike
+            // stdout text); it is consumed and deleted here on every outcome.
+            let final_path = read_final_path_file(&final_path_file);
+
+            match status {
+                Ok(exit) if exit.success() => {
+                    match resolve_verified_result(final_path, destination_filename, &output_dir) {
+                        Ok((filename, filepath)) => emit_complete(
+                            &app,
+                            &DownloadResult {
+                                filename,
+                                filepath,
+                                output_dir: output_dir.to_string_lossy().to_string(),
+                            },
+                        ),
+                        Err(message) => {
+                            let details = if stderr_text.trim().is_empty() {
+                                message.clone()
+                            } else {
+                                tail_text(&stderr_text, 2000)
+                            };
+                            emit_error(
+                                &app,
+                                &DownloadError {
+                                    message,
+                                    details: Some(details),
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(exit) => {
                     let details = if stderr_text.trim().is_empty() {
-                        message.clone()
+                        format!("yt-dlp exited with status {}", exit)
                     } else {
                         tail_text(&stderr_text, 2000)
                     };
                     emit_error(
                         &app,
                         &DownloadError {
-                            message,
+                            message: first_meaningful_line(&stderr_text)
+                                .unwrap_or_else(|| format!("yt-dlp exited with status {}", exit)),
                             details: Some(details),
+                        },
+                    );
+                }
+                Err(err) => {
+                    let message = format!("Download process failed: {}", err);
+                    emit_error(
+                        &app,
+                        &DownloadError {
+                            message: message.clone(),
+                            details: Some(if stderr_text.trim().is_empty() {
+                                message
+                            } else {
+                                tail_text(&stderr_text, 2000)
+                            }),
                         },
                     );
                 }
             }
         }
-        Ok(exit) => {
-            let details = if stderr_text.trim().is_empty() {
-                format!("yt-dlp exited with status {}", exit)
-            } else {
-                tail_text(&stderr_text, 2000)
-            };
-            emit_error(
-                &app,
-                &DownloadError {
-                    message: first_meaningful_line(&stderr_text)
-                        .unwrap_or_else(|| format!("yt-dlp exited with status {}", exit)),
-                    details: Some(details),
-                },
-            );
-        }
-        Err(err) => {
-            let message = format!("Download process failed: {}", err);
-            emit_error(
-                &app,
-                &DownloadError {
-                    message: message.clone(),
-                    details: Some(if stderr_text.trim().is_empty() {
-                        message
-                    } else {
-                        tail_text(&stderr_text, 2000)
-                    }),
-                },
-            );
+        None => {
+            // Cancellation won: the tree is terminated above. Reap the child
+            // (no zombie), drain the readers without panicking if they already
+            // ended, discard diagnostics, and report cancellation — never a
+            // failure just because OUR kill produced a nonzero exit.
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            let _ = std::fs::remove_file(&final_path_file);
+            emit_cancelled(&app);
         }
     }
 }
@@ -1437,6 +1564,119 @@ mod tests {
             read_final_path_file(&dir.join("ytdlp_gui_no_sidecar_xyz.txt")),
             None
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn taskkill_argv_is_pid_scoped_direct_invocation() {
+        // PID 1234 must become separate argv elements — never one shell
+        // string, and never /IM (which could kill unrelated processes).
+        assert_eq!(
+            taskkill_argv(1234),
+            vec![
+                "taskkill.exe".to_string(),
+                "/PID".to_string(),
+                "1234".to_string(),
+                "/T".to_string(),
+                "/F".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_pre_set_resolves_immediately() {
+        // Cancellation already requested before the waiter starts: must
+        // resolve at once (level-triggered, never lost).
+        let (tx, mut rx) = watch::channel(false);
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_millis(500), wait_for_cancel(&mut rx))
+            .await
+            .expect("pre-set cancellation must resolve immediately");
+    }
+
+    #[tokio::test]
+    async fn cancel_signal_sent_after_wait_starts() {
+        // Waiter starts first; the signal wakes it without polling.
+        let (tx, mut rx) = watch::channel(false);
+        let waiter = tokio::spawn(async move {
+            wait_for_cancel(&mut rx).await;
+        });
+        tokio::task::yield_now().await;
+        tx.send(true).expect("receiver alive");
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("signal must wake the waiter")
+            .expect("waiter must not panic");
+    }
+
+    #[tokio::test]
+    async fn no_cancel_signal_never_resolves() {
+        // No signal: the waiter stays pending (proves it does not invent
+        // cancellation). Bounded by timeout so the suite cannot hang.
+        let (_tx, mut rx) = watch::channel(false);
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_cancel(&mut rx),
+        )
+        .await;
+        assert!(outcome.is_err(), "must still be pending without a signal");
+    }
+
+    /// Spawn a harmless long-running child for termination tests. Windows:
+    /// `ping -n 30 127.0.0.1` (~30s, localhost-only, no network needed).
+    #[cfg(target_os = "windows")]
+    fn spawn_sleeping_child() -> tokio::process::Child {
+        tokio::process::Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("ping test child must spawn")
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn terminate_child_tree_kills_running_process() {
+        let mut child = spawn_sleeping_child();
+        let pid = child.id().expect("child has a pid");
+        assert!(process_is_running(pid));
+        terminate_child_tree(&mut child, Some(pid)).await;
+        // Reaped: wait returns promptly with a terminated status.
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .expect("reap must not hang")
+            .expect("wait must succeed");
+        assert!(!status.success(), "killed child exits nonzero");
+        assert!(!process_is_running(pid));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn terminate_child_tree_tolerates_exited_process() {
+        // Already-exited child: no panic, reap still works.
+        let mut child = spawn_sleeping_child();
+        let pid = child.id().expect("child has a pid");
+        child.kill().await.expect("direct kill works");
+        let _ = child.wait().await;
+        terminate_child_tree(&mut child, Some(pid)).await;
+    }
+
+    /// Best-effort liveness probe via `tasklist` output (read-only).
+    #[cfg(target_os = "windows")]
+    fn process_is_running(pid: u32) -> bool {
+        let output = std::process::Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .stdin(std::process::Stdio::null())
+            .output();
+        match output {
+            Ok(result) => {
+                let text = String::from_utf8_lossy(&result.stdout);
+                text.contains(&format!("\"{}\"", pid))
+            }
+            Err(_) => true,
+        }
     }
 
     #[test]
