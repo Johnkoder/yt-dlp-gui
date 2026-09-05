@@ -1,0 +1,121 @@
+.deps {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.deps__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.deps__title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.deps__refresh {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.deps__refresh:hover:not(:disabled) {
+  background: var(--bg-surface-raised);
+  color: var(--text-primary);
+}
+
+.deps__refresh:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.deps__refresh .spin {
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.deps__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  min-width: 0;
+}
+
+.dep__icon {
+  flex-shrink: 0;
+}
+
+.dep__icon--ok {
+  color: var(--success);
+}
+
+.dep__icon--missing {
+  color: var(--text-muted);
+}
+
+.dep__icon--error {
+  color: var(--warning);
+}
+
+.dep__name {
+  flex-shrink: 0;
+  width: 52px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.dep__value {
+  min-width: 0;
+  flex: 1;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  user-select: text;
+}
+
+.deps__note {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.deps__note--error {
+  color: var(--error);
+  user-select: text;
+}

@@ -20,6 +20,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::download::get_downloads_dir,
             commands::download::validate_output_directory,
             commands::download::open_output_folder,
+            commands::dependencies::check_dependencies,
         ])
 }
 

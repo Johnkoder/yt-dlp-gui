@@ -8,6 +8,10 @@ file in your Downloads folder.
 **yt-dlp** does the actual downloading — this app is a native GUI around
 the `yt-dlp.exe` binary, which is bundled as an application resource.
 
+Roles: **yt-dlp** is required and bundled; **Deno** is an external JS
+runtime yt-dlp uses for modern site extraction; **FFmpeg** is an external
+tool yt-dlp uses for merging separate streams and future conversion.
+
 ## Current features
 
 - Paste a video URL and download it with one click (Enter works too)
@@ -29,6 +33,8 @@ the `yt-dlp.exe` binary, which is bundled as an application resource.
   FFmpeg produces an understandable error, never a fake file
 - Clear success state with an **Open Folder** button that opens the
   actual folder the download went to
+- Dependency detection with Refresh: bundled yt-dlp version, system
+  Deno status, system FFmpeg status (with ffprobe note)
 - Understandable errors (bad URL, unavailable/private video, unavailable
   quality, missing FFmpeg, HTTP and network failures, missing yt-dlp
   binary, missing Deno) with stderr details in the UI
@@ -88,22 +94,29 @@ yt-dlp-gui/
 │   ├── components/            # UrlInput, DownloadButton,
 │   │                          # DownloadProgress, StatusMessage,
 │   │                          # MediaTypeSelector, QualitySelector,
-│   │                          # OutputFolderSelector
+│   │                          # OutputFolderSelector, DependencySection
 │   ├── features/downloads/
 │   │   ├── hooks/useDownload.ts   # initializing|ready|downloading|success|error
 │   │   ├── downloadService.ts     # Tauri invoke/listen/dialog wrapper + errors
 │   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
 │   │   ├── outputDirectory.ts     # output-folder preference persistence
 │   │   └── types.ts
+│   ├── features/dependencies/
+│   │   ├── hooks/useDependencies.ts  # idle|loading|ready|error checks
+│   │   ├── dependencyService.ts      # check_dependencies wrapper
+│   │   └── types.ts
 │   ├── styles/                # variables.css, globals.css
 │   ├── App.tsx                # composes components (no business logic)
 │   └── main.tsx
 ├── src-tauri/
 │   ├── src/
-│   │   ├── commands/download.rs   # start_download, get_downloads_dir,
-│   │   │                          # open_downloads_folder
-│   │   ├── services/ytdlp.rs      # binary resolver, argv builder,
-│   │   │                          # progress parser, process runner
+│   │   ├── commands/
+│   │   │   ├── download.rs        # start_download, dirs, open_output_folder
+│   │   │   └── dependencies.rs    # check_dependencies
+│   │   ├── services/
+│   │   │   ├── ytdlp.rs           # binary resolver, argv builder,
+│   │   │   │                      # progress parser, process runner
+│   │   │   └── dependencies.rs    # yt-dlp/Deno/FFmpeg detection
 │   │   ├── lib.rs                 # composition root
 │   │   └── main.rs
 │   ├── resources/bin/yt-dlp.exe   # bundled downloader binary
@@ -131,12 +144,14 @@ yt-dlp-gui/
   may download separate video and audio streams and merge them. Merging
   needs an `ffmpeg` reachable via `PATH` (any standard install works,
   e.g. `C:\ytdlp`). Without it, such downloads fail with an
-  understandable error instead of silently producing a wrong file. A
-  proper dependency screen is on the roadmap.
+  understandable error instead of silently producing a wrong file.
 - **Deno** (optional, not bundled): yt-dlp discovers a system Deno
   install via `PATH` and uses it as its JavaScript runtime for sites
   that need one. Without it yt-dlp prints a warning and some formats
   may be missing. The app never bundles or manages Deno itself.
+
+The app detects all three at startup (Dependencies section + Refresh)
+but does NOT automatically install Deno or FFmpeg yet.
 
 ## Installation steps
 
@@ -203,13 +218,14 @@ Completed:
 - quality selector (Best / 2160p–360p presets)
 - video / native-audio download mode
 - output folder selection (native picker, remembered, safe fallback)
+- dependency detection (bundled yt-dlp, system Deno, system FFmpeg)
 
-Next:
-- dependency detection (FFmpeg / Deno status screen)
-- audio format conversion (MP3, …)
-- download queue · multiple simultaneous downloads · playlists ·
-  history · cancellation · settings · yt-dlp self-updates · FFmpeg
-  management
+Possible next:
+- FFmpeg-assisted audio conversion / MP3
+- dependency setup assistance
+- cancellation
+- queue
+etc.
 
 ## License
 

@@ -1,3 +1,4 @@
+import { DependencySection } from "./components/DependencySection";
 import { DownloadButton } from "./components/DownloadButton";
 import { DownloadProgress } from "./components/DownloadProgress";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
@@ -5,6 +6,7 @@ import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
 import { StatusMessage } from "./components/StatusMessage";
 import { UrlInput } from "./components/UrlInput";
+import { useDependencies } from "./features/dependencies/hooks/useDependencies";
 import { useDownload } from "./features/downloads/hooks/useDownload";
 import "./App.css";
 
@@ -29,11 +31,19 @@ export default function App() {
     handleReset,
   } = useDownload();
 
+  const dependencies = useDependencies();
+
   const isInitializing = status === "initializing";
   const isDownloading = status === "downloading";
   const backendUnreachable = subscription === "failed";
   const optionsLocked = isDownloading || isInitializing;
   const isAudio = mediaType === "audio";
+  // Only yt-dlp gates downloads; Deno/FFmpeg degrade gracefully.
+  const ytdlpState = dependencies.report?.ytDlp.state;
+  const ytdlpMissing = ytdlpState === "missing" || ytdlpState === "error";
+  const downloadAllowed = canDownload && !ytdlpMissing;
+  const showFfmpegNote =
+    !isAudio && dependencies.report?.ffmpeg.state === "missing";
   // While downloading the button falls back to its internal "Downloading…".
   const actionLabel = isInitializing
     ? "Loading…"
@@ -64,7 +74,11 @@ export default function App() {
         <UrlInput
           value={url}
           onChange={setUrl}
-          onSubmit={handleDownload}
+          onSubmit={() => {
+            if (downloadAllowed) {
+              void handleDownload();
+            }
+          }}
           disabled={optionsLocked}
         />
 
@@ -75,11 +89,19 @@ export default function App() {
         />
 
         {!isAudio && (
-          <QualitySelector
-            value={quality}
-            onChange={setQuality}
-            disabled={optionsLocked}
-          />
+          <>
+            <QualitySelector
+              value={quality}
+              onChange={setQuality}
+              disabled={optionsLocked}
+            />
+            {showFfmpegNote && (
+              <p className="hint">
+                FFmpeg is not installed. Some video qualities may require it
+                to merge video and audio.
+              </p>
+            )}
+          </>
         )}
 
         <OutputFolderSelector
@@ -89,11 +111,22 @@ export default function App() {
         />
 
         <DownloadButton
-          disabled={!canDownload}
+          disabled={!downloadAllowed}
           loading={isDownloading || isInitializing}
           label={actionLabel}
-          onClick={handleDownload}
+          onClick={() => {
+            if (downloadAllowed) {
+              void handleDownload();
+            }
+          }}
         />
+
+        {ytdlpMissing && !isDownloading && (
+          <p className="hint hint--error" role="note">
+            Downloads unavailable: yt-dlp is{" "}
+            {ytdlpState === "error" ? "reporting an error" : "missing"}.
+          </p>
+        )}
 
         {isDownloading && <DownloadProgress progress={progress} />}
 
@@ -115,6 +148,15 @@ export default function App() {
             onReset={backendUnreachable ? null : handleReset}
           />
         )}
+
+        <DependencySection
+          status={dependencies.status}
+          report={dependencies.report}
+          errorMessage={dependencies.errorMessage}
+          onRefresh={() => {
+            void dependencies.refresh();
+          }}
+        />
       </main>
 
       <footer className="app-footer">

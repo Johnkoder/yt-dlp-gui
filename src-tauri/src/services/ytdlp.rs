@@ -770,7 +770,8 @@ fn tail_text(text: &str, max_chars: usize) -> String {
 /// Pick the user-facing message from yt-dlp stderr: the last `ERROR:` line
 /// wins (earlier warnings must not hide a later real error); otherwise the
 /// first other meaningful line; `None` when there is nothing to show.
-fn first_meaningful_line(text: &str) -> Option<String> {
+/// Shared with the dependency checker for version-command failures.
+pub(crate) fn first_meaningful_line(text: &str) -> Option<String> {
     let mut fallback: Option<String> = None;
     let mut last_error: Option<String> = None;
     for line in text.lines() {
