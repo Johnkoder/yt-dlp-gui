@@ -20,11 +20,14 @@ body {
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
-  overflow: hidden;
+  /* The app grows with its content (e.g. a long download queue) and the
+     whole page scrolls vertically. Never clip it with overflow: hidden. */
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 #root {
-  height: 100vh;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
 }
