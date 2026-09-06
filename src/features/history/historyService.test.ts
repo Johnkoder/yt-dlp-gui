@@ -48,11 +48,12 @@ describe("historyService", () => {
     expect(result).toEqual(mockEntries);
   });
 
-  it("clearHistory invokes clear_history command", async () => {
-    mockInvoke.mockResolvedValueOnce(undefined);
+  it("clearHistory invokes clear_history command and returns barrier nextId", async () => {
+    mockInvoke.mockResolvedValueOnce({ nextId: 10 });
 
-    await clearHistory();
+    const result = await clearHistory();
     expect(mockInvoke).toHaveBeenCalledWith("clear_history");
+    expect(result).toEqual({ nextId: 10 });
   });
 
   it("subscribeToHistoryEvents listens for history-entry-added event", async () => {

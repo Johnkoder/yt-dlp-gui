@@ -108,8 +108,12 @@ function defaultAnswer(command: string, args?: unknown) {
     return Promise.resolve(backend.history);
   }
   if (command === "clear_history") {
+    const nextId =
+      backend.history.length > 0
+        ? Math.max(...backend.history.map((e) => e.id)) + 1
+        : 1;
     backend.history = [];
-    return Promise.resolve();
+    return Promise.resolve({ nextId });
   }
   return Promise.resolve(undefined);
 }

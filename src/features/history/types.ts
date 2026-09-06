@@ -19,3 +19,8 @@ export interface HistoryEntry {
   filepath?: string | null;
   message?: string | null;
 }
+
+export interface ClearHistoryResult {
+  nextId: number;
+}
+

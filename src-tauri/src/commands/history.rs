@@ -2,7 +2,7 @@
 
 use tauri::{AppHandle, State};
 
-use crate::services::history::{HistoryEntry, HistoryState};
+use crate::services::history::{ClearHistoryResult, HistoryEntry, HistoryState};
 
 /// Retrieve all persisted history entries, ordered newest first.
 #[tauri::command]
@@ -17,9 +17,12 @@ pub async fn get_history(
     Ok(manager.get_entries_newest_first())
 }
 
-/// Clear all persisted history entries. Does not delete any downloaded media files.
+/// Clear all persisted history entries. Returns the ID barrier for newly created entries.
 #[tauri::command]
-pub async fn clear_history(app: AppHandle, state: State<'_, HistoryState>) -> Result<(), String> {
+pub async fn clear_history(
+    app: AppHandle,
+    state: State<'_, HistoryState>,
+) -> Result<ClearHistoryResult, String> {
     let mut guard = state.get_manager(&app).await?;
     let manager = guard
         .as_mut()

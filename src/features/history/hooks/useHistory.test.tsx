@@ -1,8 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
-import { renderHook, act, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { renderHook, act, waitFor, cleanup } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useHistory } from "./useHistory";
 import * as historyService from "../historyService";
 import type { HistoryEntry } from "../types";
@@ -17,6 +17,10 @@ vi.mock("../historyService", () => ({
 describe("useHistory hook", () => {
   let eventCallback: ((entry: HistoryEntry) => void) | null = null;
   const mockUnlisten = vi.fn();
+
+  afterEach(() => {
+    cleanup();
+  });
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -162,22 +166,201 @@ describe("useHistory hook", () => {
     expect(result.current.entries[0].id).toBe(1);
   });
 
-  it("clears history successfully and updates state", async () => {
-    const entry: HistoryEntry = {
+  it("A. normal clear: history [1, 2], clear returns nextId 3 -> result []", async () => {
+    const e1: HistoryEntry = {
       id: 1,
       timestampMs: 1000,
       url: "https://example.com/1",
       mediaType: "video",
       quality: "best",
-      audioFormat: null,
       outputDirectory: "C:\\Downloads",
       status: "success",
-      filename: "vid.mp4",
-      filepath: null,
-      message: null,
     };
-    vi.mocked(historyService.getHistory).mockResolvedValueOnce([entry]);
-    vi.mocked(historyService.clearHistory).mockResolvedValueOnce();
+    const e2: HistoryEntry = {
+      id: 2,
+      timestampMs: 2000,
+      url: "https://example.com/2",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    vi.mocked(historyService.getHistory).mockResolvedValueOnce([e2, e1]);
+    vi.mocked(historyService.clearHistory).mockResolvedValueOnce({ nextId: 3 });
+
+    const { result } = renderHook(() => useHistory());
+
+    await waitFor(() => {
+      expect(result.current.status).toBe("ready");
+    });
+    expect(result.current.entries.length).toBe(2);
+
+    let success: boolean | undefined;
+    await act(async () => {
+      success = await result.current.clearAllHistory();
+    });
+
+    expect(success).toBe(true);
+    expect(historyService.clearHistory).toHaveBeenCalled();
+    expect(result.current.entries).toEqual([]);
+    expect(result.current.clearError).toBeNull();
+  });
+
+  it("B & Req 2C. race test: new event after backend clear boundary (event 12 arrives while clear pending, clear returns nextId 12 -> 12 remains)", async () => {
+    const e10: HistoryEntry = {
+      id: 10,
+      timestampMs: 1000,
+      url: "https://example.com/10",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    const e11: HistoryEntry = {
+      id: 11,
+      timestampMs: 1100,
+      url: "https://example.com/11",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    vi.mocked(historyService.getHistory).mockResolvedValueOnce([e11, e10]);
+
+    let resolveClear!: (val: { nextId: number }) => void;
+    const clearPromise = new Promise<{ nextId: number }>((resolve) => {
+      resolveClear = resolve;
+    });
+    vi.mocked(historyService.clearHistory).mockReturnValueOnce(clearPromise);
+
+    const { result } = renderHook(() => useHistory());
+
+    // 1. Render history with IDs 10 and 11
+    await waitFor(() => {
+      expect(result.current.status).toBe("ready");
+    });
+    expect(result.current.entries.map((e) => e.id)).toEqual([11, 10]);
+
+    // 2. Call clearAllHistory()
+    let clearSuccess: boolean | undefined;
+    const clearPromiseResult = result.current.clearAllHistory().then((res) => {
+      clearSuccess = res;
+    });
+
+    // 3. Keep clear_history Promise unresolved & verify isClearing
+    await waitFor(() => {
+      expect(result.current.isClearing).toBe(true);
+    });
+
+    // 4. Emit history-entry-added ID 12 while clear is in-flight
+    const e12: HistoryEntry = {
+      id: 12,
+      timestampMs: 1200,
+      url: "https://example.com/12",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+      filename: "video12.mp4",
+    };
+    act(() => {
+      eventCallback?.(e12);
+    });
+
+    // 5. Assert ID 12 is visible alongside in-flight entries
+    expect(result.current.entries.map((e) => e.id)).toEqual([12, 11, 10]);
+
+    // 6. Resolve clear_history with barrier nextId = 12
+    await act(async () => {
+      resolveClear({ nextId: 12 });
+      await clearPromiseResult;
+    });
+
+    expect(clearSuccess).toBe(true);
+    expect(result.current.isClearing).toBe(false);
+
+    // 7. Final entries must be: ID 12 only (10 and 11 filtered out)
+    expect(result.current.entries.map((e) => e.id)).toEqual([12]);
+  });
+
+  it("C. race test: event belongs to old generation (event 12 arrived before backend clear committed, clear returns nextId 13 -> 12 removed)", async () => {
+    const e10: HistoryEntry = {
+      id: 10,
+      timestampMs: 1000,
+      url: "https://example.com/10",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    const e11: HistoryEntry = {
+      id: 11,
+      timestampMs: 1100,
+      url: "https://example.com/11",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    vi.mocked(historyService.getHistory).mockResolvedValueOnce([e11, e10]);
+
+    let resolveClear!: (val: { nextId: number }) => void;
+    const clearPromise = new Promise<{ nextId: number }>((resolve) => {
+      resolveClear = resolve;
+    });
+    vi.mocked(historyService.clearHistory).mockReturnValueOnce(clearPromise);
+
+    const { result } = renderHook(() => useHistory());
+
+    await waitFor(() => {
+      expect(result.current.status).toBe("ready");
+    });
+
+    const clearPromiseResult = result.current.clearAllHistory();
+
+    await waitFor(() => {
+      expect(result.current.isClearing).toBe(true);
+    });
+
+    // Event 12 arrives before backend clear completes
+    const e12: HistoryEntry = {
+      id: 12,
+      timestampMs: 1200,
+      url: "https://example.com/12",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    act(() => {
+      eventCallback?.(e12);
+    });
+    expect(result.current.entries.map((e) => e.id)).toEqual([12, 11, 10]);
+
+    // Backend clear committed after 12 was written on backend, so barrier is 13
+    await act(async () => {
+      resolveClear({ nextId: 13 });
+      await clearPromiseResult;
+    });
+
+    // Both old entries and 12 (< 13) are cleared
+    expect(result.current.entries).toEqual([]);
+  });
+
+  it("D. clear failure leaves history unchanged", async () => {
+    const e1: HistoryEntry = {
+      id: 1,
+      timestampMs: 1000,
+      url: "https://example.com/1",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    vi.mocked(historyService.getHistory).mockResolvedValueOnce([e1]);
+    vi.mocked(historyService.clearHistory).mockRejectedValueOnce(
+      new Error("Permission denied"),
+    );
 
     const { result } = renderHook(() => useHistory());
 
@@ -191,17 +374,24 @@ describe("useHistory hook", () => {
       success = await result.current.clearAllHistory();
     });
 
-    expect(success).toBe(true);
-    expect(historyService.clearHistory).toHaveBeenCalled();
-    expect(result.current.entries).toEqual([]);
-    expect(result.current.clearError).toBeNull();
+    expect(success).toBe(false);
+    expect(result.current.clearError).toBe("Permission denied");
+    // Entries are untouched!
+    expect(result.current.entries).toEqual([e1]);
   });
 
-  it("sets clearError when clearHistory fails", async () => {
-    vi.mocked(historyService.getHistory).mockResolvedValueOnce([]);
-    vi.mocked(historyService.clearHistory).mockRejectedValueOnce(
-      new Error("Permission denied"),
-    );
+  it("E. subsequent live event after successful clear (clear nextId 20, event 20 arrives afterward -> 20 appears)", async () => {
+    const e1: HistoryEntry = {
+      id: 1,
+      timestampMs: 1000,
+      url: "https://example.com/1",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+    };
+    vi.mocked(historyService.getHistory).mockResolvedValueOnce([e1]);
+    vi.mocked(historyService.clearHistory).mockResolvedValueOnce({ nextId: 20 });
 
     const { result } = renderHook(() => useHistory());
 
@@ -209,13 +399,27 @@ describe("useHistory hook", () => {
       expect(result.current.status).toBe("ready");
     });
 
-    let success: boolean | undefined;
     await act(async () => {
-      success = await result.current.clearAllHistory();
+      await result.current.clearAllHistory();
+    });
+    expect(result.current.entries).toEqual([]);
+
+    // Event 20 arrives afterward
+    const e20: HistoryEntry = {
+      id: 20,
+      timestampMs: 2000,
+      url: "https://example.com/20",
+      mediaType: "video",
+      quality: "best",
+      outputDirectory: "C:\\Downloads",
+      status: "success",
+      filename: "video20.mp4",
+    };
+    act(() => {
+      eventCallback?.(e20);
     });
 
-    expect(success).toBe(false);
-    expect(result.current.clearError).toBe("Permission denied");
+    expect(result.current.entries).toEqual([e20]);
   });
 
   it("cleans up event listener on unmount", async () => {

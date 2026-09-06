@@ -146,11 +146,98 @@ fn backup_corrupt_file(path: &Path, tag: &str) {
     let _ = std::fs::rename(path, &backup_path);
 }
 
-/// Atomically serialize and write `store` to `path` via a temporary file.
-pub fn save_history(path: &Path, store: &HistoryStore) -> Result<(), String> {
+#[cfg(windows)]
+extern "system" {
+    fn ReplaceFileW(
+        lpReplacedFileName: *const u16,
+        lpReplacementFileName: *const u16,
+        lpBackupFileName: *const u16,
+        dwReplaceFlags: u32,
+        lpExclude: *mut std::ffi::c_void,
+        lpReserved: *mut std::ffi::c_void,
+    ) -> i32;
+
+    fn MoveFileExW(lpExistingFileName: *const u16, lpNewFileName: *const u16, dwFlags: u32) -> i32;
+
+    fn GetLastError() -> u32;
+}
+
+/// Safely replace `target_path` with `temp_path` on Windows without deleting `target_path` first.
+///
+/// If `target_path` exists, `ReplaceFileW` atomically replaces it while leaving it intact if
+/// replacement fails. If `target_path` does not yet exist, `MoveFileExW` commits the new file.
+#[cfg(windows)]
+pub fn replace_file_atomic(temp_path: &Path, target_path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x00000001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x00000008;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+
+    let to_wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+
+    let temp_wide = to_wide(temp_path);
+    let target_wide = to_wide(target_path);
+
+    if target_path.exists() {
+        let res = unsafe {
+            ReplaceFileW(
+                target_wide.as_ptr(),
+                temp_wide.as_ptr(),
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if res != 0 {
+            return Ok(());
+        }
+        let err = unsafe { GetLastError() };
+        if err != ERROR_FILE_NOT_FOUND {
+            return Err(std::io::Error::from_raw_os_error(err as i32));
+        }
+    }
+
+    let res = unsafe {
+        MoveFileExW(
+            temp_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if res != 0 {
+        Ok(())
+    } else {
+        let err = unsafe { GetLastError() };
+        Err(std::io::Error::from_raw_os_error(err as i32))
+    }
+}
+
+/// Cross-platform atomic replacement on non-Windows platforms.
+#[cfg(not(windows))]
+pub fn replace_file_atomic(temp_path: &Path, target_path: &Path) -> Result<(), std::io::Error> {
+    std::fs::rename(temp_path, target_path)
+}
+
+pub type CommitterFn = fn(&Path, &Path) -> Result<(), std::io::Error>;
+
+/// Atomically serialize and write `store` to `path` using the supplied committer.
+pub fn save_history_impl(
+    path: &Path,
+    store: &HistoryStore,
+    committer: CommitterFn,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create history directory: {e}"))?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create history directory: {e}"))?;
+        }
     }
 
     let json_bytes = serde_json::to_vec_pretty(store)
@@ -165,25 +252,34 @@ pub fn save_history(path: &Path, store: &HistoryStore) -> Result<(), String> {
         use std::io::Write;
         let mut file = std::fs::File::create(&temp_path)
             .map_err(|e| format!("Failed to create temporary history file: {e}"))?;
-        file.write_all(&json_bytes)
-            .map_err(|e| format!("Failed to write temporary history file: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("Failed to flush temporary history file: {e}"))?;
+        file.write_all(&json_bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!("Failed to write temporary history file: {e}")
+        })?;
+        file.sync_all().map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!("Failed to flush temporary history file: {e}")
+        })?;
     }
 
-    #[cfg(windows)]
-    {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-
-    std::fs::rename(&temp_path, path).map_err(|e| {
+    if let Err(e) = committer(&temp_path, path) {
         let _ = std::fs::remove_file(&temp_path);
-        format!("Failed to commit history file: {e}")
-    })?;
+        return Err(format!("Failed to commit history file: {e}"));
+    }
 
     Ok(())
+}
+
+/// Atomically serialize and write `store` to `path` via a temporary file and safe replacement.
+pub fn save_history(path: &Path, store: &HistoryStore) -> Result<(), String> {
+    save_history_impl(path, store, replace_file_atomic)
+}
+
+/// Result of clearing history, returning the ID barrier.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearHistoryResult {
+    pub next_id: u64,
 }
 
 /// Append an entry with a monotonic persistent ID.
@@ -276,16 +372,33 @@ pub fn entry_from_outcome(
     }
 }
 
-/// Manages thread-safe in-memory history operations and synchronous disk persistence.
+pub type SaveHistoryFn = fn(&Path, &HistoryStore) -> Result<(), String>;
+
+/// Manages thread-safe in-memory history operations and transactional disk persistence.
 pub struct HistoryManager {
     path: PathBuf,
     store: HistoryStore,
+    save_fn: SaveHistoryFn,
 }
 
 impl HistoryManager {
     pub fn new(path: PathBuf) -> Self {
         let store = load_history(&path);
-        Self { path, store }
+        Self {
+            path,
+            store,
+            save_fn: save_history,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_save_fn(path: PathBuf, save_fn: SaveHistoryFn) -> Self {
+        let store = load_history(&path);
+        Self {
+            path,
+            store,
+            save_fn,
+        }
     }
 
     /// Retrieve all history entries, ordered newest first.
@@ -293,21 +406,40 @@ impl HistoryManager {
         self.store.entries.iter().rev().cloned().collect()
     }
 
-    /// Record a terminal outcome and immediately commit to disk.
+    /// Current in-memory store reference.
+    #[cfg(test)]
+    pub fn store(&self) -> &HistoryStore {
+        &self.store
+    }
+
+    /// Record a terminal outcome and commit transactionally to disk with copy-on-write.
+    ///
+    /// If persistence fails, the in-memory store and `next_id` remain unmodified.
     pub fn record(
         &mut self,
         request: &StartDownloadRequest,
         outcome: &DownloadTerminalOutcome,
     ) -> Result<HistoryEntry, String> {
-        let entry = entry_from_outcome(&mut self.store, request, outcome);
-        save_history(&self.path, &self.store)?;
+        let mut candidate = self.store.clone();
+        let entry = entry_from_outcome(&mut candidate, request, outcome);
+        (self.save_fn)(&self.path, &candidate)?;
+        self.store = candidate;
         Ok(entry)
     }
 
-    /// Clear all entries and commit the cleared state to disk.
-    pub fn clear(&mut self) -> Result<(), String> {
-        clear_entries(&mut self.store);
-        save_history(&self.path, &self.store)
+    /// Clear all entries and commit transactionally to disk with copy-on-write.
+    ///
+    /// Returns a `ClearHistoryResult` containing the barrier `next_id`.
+    /// Any entry created after this clear has an `id >= barrier.next_id`.
+    /// If persistence fails, existing in-memory entries remain unmodified.
+    pub fn clear(&mut self) -> Result<ClearHistoryResult, String> {
+        let mut candidate = self.store.clone();
+        clear_entries(&mut candidate);
+        (self.save_fn)(&self.path, &candidate)?;
+        self.store = candidate;
+        Ok(ClearHistoryResult {
+            next_id: self.store.next_id,
+        })
     }
 }
 
@@ -632,5 +764,202 @@ mod tests {
         assert_eq!(entry.message, Some("Download cancelled.".to_string()));
         assert!(entry.filename.is_none());
         assert!(entry.filepath.is_none());
+    }
+
+    fn failing_save_fn(_path: &Path, _store: &HistoryStore) -> Result<(), String> {
+        Err("Simulated save failure".to_string())
+    }
+
+    fn successful_save_fn(_path: &Path, _store: &HistoryStore) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn failing_committer(_temp: &Path, _target: &Path) -> Result<(), std::io::Error> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Simulated commit failure",
+        ))
+    }
+
+    #[test]
+    fn test_failed_record_save_leaves_in_memory_store_unchanged() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, failing_save_fn);
+        assert_eq!(manager.store().entries.len(), 0);
+        assert_eq!(manager.store().next_id, 1);
+
+        let req = test_request();
+        let outcome = DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+            job_id: 1,
+            message: "Cancelled".to_string(),
+        });
+
+        let res = manager.record(&req, &outcome);
+        assert!(res.is_err());
+        assert_eq!(manager.store().entries.len(), 0);
+        assert_eq!(manager.store().next_id, 1);
+    }
+
+    #[test]
+    fn test_failed_clear_save_leaves_in_memory_store_unchanged() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, successful_save_fn);
+        let req = test_request();
+        let outcome = DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+            job_id: 1,
+            message: "Cancelled".to_string(),
+        });
+        let _ = manager.record(&req, &outcome).unwrap();
+        assert_eq!(manager.store().entries.len(), 1);
+        assert_eq!(manager.store().next_id, 2);
+
+        manager.save_fn = failing_save_fn;
+        let res = manager.clear();
+        assert!(res.is_err());
+        assert_eq!(manager.store().entries.len(), 1);
+        assert_eq!(manager.store().next_id, 2);
+    }
+
+    #[test]
+    fn test_failed_record_does_not_advance_next_id() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, failing_save_fn);
+        manager.store = HistoryStore {
+            version: 1,
+            next_id: 20,
+            entries: Vec::new(),
+        };
+
+        let req = test_request();
+        let outcome = DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+            job_id: 1,
+            message: "Cancelled".to_string(),
+        });
+
+        let res = manager.record(&req, &outcome);
+        assert!(res.is_err());
+        assert_eq!(manager.store().next_id, 20);
+
+        manager.save_fn = successful_save_fn;
+        let res2 = manager.record(&req, &outcome);
+        assert!(res2.is_ok());
+        let entry = res2.unwrap();
+        assert_eq!(entry.id, 20);
+        assert_eq!(manager.store().next_id, 21);
+    }
+
+    #[test]
+    fn test_successful_record_advances_next_id_exactly_once() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, successful_save_fn);
+        manager.store = HistoryStore {
+            version: 1,
+            next_id: 5,
+            entries: Vec::new(),
+        };
+
+        let req = test_request();
+        let outcome = DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+            job_id: 1,
+            message: "Cancelled".to_string(),
+        });
+
+        let entry = manager.record(&req, &outcome).unwrap();
+        assert_eq!(entry.id, 5);
+        assert_eq!(manager.store().next_id, 6);
+        assert_eq!(manager.store().entries.len(), 1);
+    }
+
+    #[test]
+    fn test_successful_clear_preserves_next_id() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, successful_save_fn);
+        manager.store = HistoryStore {
+            version: 1,
+            next_id: 15,
+            entries: vec![HistoryEntry {
+                id: 14,
+                timestamp_ms: 1000,
+                url: "https://example.com".to_string(),
+                media_type: MediaType::Video,
+                quality: None,
+                audio_format: None,
+                output_directory: "C:\\".to_string(),
+                status: HistoryStatus::Success,
+                filename: None,
+                filepath: None,
+                message: None,
+            }],
+        };
+
+        let res = manager.clear().unwrap();
+        assert_eq!(res.next_id, 15);
+        assert_eq!(manager.store().next_id, 15);
+        assert!(manager.store().entries.is_empty());
+    }
+
+    #[test]
+    fn test_successful_clear_returns_correct_barrier() {
+        let dummy_path = PathBuf::from("dummy_history.json");
+        let mut manager = HistoryManager::with_save_fn(dummy_path, successful_save_fn);
+        manager.store = HistoryStore {
+            version: 1,
+            next_id: 50,
+            entries: Vec::new(),
+        };
+
+        let res = manager.clear().unwrap();
+        assert_eq!(res.next_id, 50);
+    }
+
+    #[test]
+    fn test_old_history_file_remains_intact_when_replacement_fails() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("yt_dlp_replace_fail_{}", current_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let history_file = temp_dir.join("history.json");
+
+        let original_content = r#"{"version":1,"nextId":10,"entries":[]}"#;
+        std::fs::write(&history_file, original_content).unwrap();
+
+        let new_store = HistoryStore {
+            version: 1,
+            next_id: 11,
+            entries: vec![],
+        };
+
+        let res = save_history_impl(&history_file, &new_store, failing_committer);
+        assert!(res.is_err());
+
+        let content_after = std::fs::read_to_string(&history_file).unwrap();
+        assert_eq!(content_after, original_content);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_temp_file_cleanup_after_replacement_failure() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("yt_dlp_cleanup_fail_{}", current_timestamp_ms()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let history_file = temp_dir.join("history.json");
+
+        let store = HistoryStore::default();
+        let res = save_history_impl(&history_file, &store, failing_committer);
+        assert!(res.is_err());
+
+        let entries: Vec<_> = std::fs::read_dir(&temp_dir)
+            .unwrap()
+            .map(|r| r.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            !entries
+                .iter()
+                .any(|name| name.starts_with("history.json.tmp.")),
+            "Temporary file must be cleaned up on replacement failure"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

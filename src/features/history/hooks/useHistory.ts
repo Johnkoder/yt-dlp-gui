@@ -93,8 +93,8 @@ export function useHistory(): UseHistoryReturn {
     setIsClearing(true);
     setClearError(null);
     try {
-      await apiClearHistory();
-      setEntries([]);
+      const result = await apiClearHistory();
+      setEntries((prev) => prev.filter((entry) => entry.id >= result.nextId));
       return true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

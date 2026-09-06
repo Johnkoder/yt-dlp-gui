@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { HistoryEntry } from "./types";
+import type { ClearHistoryResult, HistoryEntry } from "./types";
 
 export const HISTORY_ENTRY_ADDED_EVENT = "history-entry-added";
 
@@ -12,10 +12,10 @@ export async function getHistory(): Promise<HistoryEntry[]> {
 }
 
 /**
- * Clear all history entries from disk.
+ * Clear all history entries from disk. Returns the barrier nextId.
  */
-export async function clearHistory(): Promise<void> {
-  await invoke<void>("clear_history");
+export async function clearHistory(): Promise<ClearHistoryResult> {
+  return invoke<ClearHistoryResult>("clear_history");
 }
 
 /**
