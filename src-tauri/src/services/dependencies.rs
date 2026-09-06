@@ -74,7 +74,10 @@ async fn run_version_command(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    let child = TokioCommand::new(binary)
+    let mut command = TokioCommand::new(binary);
+    #[cfg(windows)]
+    command.creation_flags(super::ytdlp::CREATE_NO_WINDOW);
+    let child = command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

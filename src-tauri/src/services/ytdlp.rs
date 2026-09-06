@@ -424,6 +424,9 @@ pub(crate) fn is_valid_http_url(url: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() <= 2048
 }
 
+/// Process creation flag on Windows: prevent console/terminal window from appearing.
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Build a yt-dlp child process with the shared environment: if Deno lives
 /// only at the user fallback (~/.deno/bin), that directory is prepended to
 /// the CHILD's PATH only, so every yt-dlp invocation — downloads and
@@ -431,6 +434,8 @@ pub(crate) fn is_valid_http_url(url: &str) -> bool {
 /// system environment is never modified.
 pub(crate) fn yt_dlp_command(binary: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(binary);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
     if let Some(deno_dir) = deno_child_path_dir() {
         if let Ok(child_path) = prepend_to_path_list(std::env::var_os("PATH"), &deno_dir) {
             command.env("PATH", child_path);
@@ -756,7 +761,9 @@ fn taskkill_argv(pid: u32) -> Vec<String> {
 #[cfg(target_os = "windows")]
 async fn kill_process_tree(pid: u32) {
     let argv = taskkill_argv(pid);
-    let spawned = tokio::process::Command::new(&argv[0])
+    let mut cmd = tokio::process::Command::new(&argv[0]);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let spawned = cmd
         .args(&argv[1..])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
