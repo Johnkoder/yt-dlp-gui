@@ -30,7 +30,7 @@ static FINAL_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// What to download: full video or native audio stream. Strongly typed so
 /// no raw string ever travels deep into the backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaType {
     Video,
@@ -40,7 +40,7 @@ pub enum MediaType {
 /// Video resolution presets. The frontend deals in these semantic values —
 /// never in yt-dlp format IDs or raw `-f` fragments. Unknown strings fail
 /// deserialization, so a malicious value can never become an argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoQuality {
     #[serde(rename = "best")]
     Best,
@@ -76,7 +76,7 @@ impl VideoQuality {
 /// Audio format presets. The frontend deals in these semantic values —
 /// never in yt-dlp post-processing flags. Unknown strings fail
 /// deserialization, so a malicious value can never become an argument.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AudioFormat {
     Original,
@@ -303,6 +303,14 @@ pub struct DownloadError {
 pub struct DownloadCancelled {
     pub job_id: u64,
     pub message: String,
+}
+
+/// The terminal result of a single download execution.
+#[derive(Debug, Clone)]
+pub enum DownloadTerminalOutcome {
+    Complete(DownloadResult),
+    Error(DownloadError),
+    Cancelled(DownloadCancelled),
 }
 
 /// Locate the yt-dlp executable.
@@ -807,19 +815,17 @@ pub async fn run_download(
     job_id: u64,
     options: DownloadOptions,
     mut cancel_rx: watch::Receiver<bool>,
-) {
+) -> DownloadTerminalOutcome {
     let binary = match resolve_ytdlp_path(&app) {
         Ok(path) => path,
         Err(message) => {
-            emit_error(
-                &app,
-                &DownloadError {
-                    job_id,
-                    message: message.clone(),
-                    details: Some(message),
-                },
-            );
-            return;
+            let error = DownloadError {
+                job_id,
+                message: message.clone(),
+                details: Some(message),
+            };
+            emit_error(&app, &error);
+            return DownloadTerminalOutcome::Error(error);
         }
     };
 
@@ -832,7 +838,10 @@ pub async fn run_download(
     // the select below terminates the fresh child at once instead.)
     if *cancel_rx.borrow() {
         emit_cancelled(&app, job_id);
-        return;
+        return DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+            job_id,
+            message: "Download cancelled.".to_string(),
+        });
     }
 
     let mut command = yt_dlp_command(&binary);
@@ -848,15 +857,13 @@ pub async fn run_download(
         Err(err) => {
             let _ = std::fs::remove_file(&final_path_file);
             let message = format!("Could not launch yt-dlp: {}", err);
-            emit_error(
-                &app,
-                &DownloadError {
-                    job_id,
-                    message: message.clone(),
-                    details: Some(message),
-                },
-            );
-            return;
+            let error = DownloadError {
+                job_id,
+                message: message.clone(),
+                details: Some(message),
+            };
+            emit_error(&app, &error);
+            return DownloadTerminalOutcome::Error(error);
         }
     };
 
@@ -868,15 +875,13 @@ pub async fn run_download(
             let _ = child.kill().await;
             let _ = std::fs::remove_file(&final_path_file);
             let message = "Could not capture the yt-dlp process output.".to_string();
-            emit_error(
-                &app,
-                &DownloadError {
-                    job_id,
-                    message: message.clone(),
-                    details: Some(message),
-                },
-            );
-            return;
+            let error = DownloadError {
+                job_id,
+                message: message.clone(),
+                details: Some(message),
+            };
+            emit_error(&app, &error);
+            return DownloadTerminalOutcome::Error(error);
         }
     };
 
@@ -952,29 +957,29 @@ pub async fn run_download(
             match status {
                 Ok(exit) if exit.success() => {
                     match resolve_verified_result(final_path, destination_filename, &output_dir) {
-                        Ok((filename, filepath)) => emit_complete(
-                            &app,
-                            &DownloadResult {
+                        Ok((filename, filepath)) => {
+                            let result = DownloadResult {
                                 job_id,
                                 filename,
                                 filepath,
                                 output_dir: output_dir.to_string_lossy().to_string(),
-                            },
-                        ),
+                            };
+                            emit_complete(&app, &result);
+                            DownloadTerminalOutcome::Complete(result)
+                        }
                         Err(message) => {
                             let details = if stderr_text.trim().is_empty() {
                                 message.clone()
                             } else {
                                 tail_text(&stderr_text, 2000)
                             };
-                            emit_error(
-                                &app,
-                                &DownloadError {
-                                    job_id,
-                                    message,
-                                    details: Some(details),
-                                },
-                            );
+                            let error = DownloadError {
+                                job_id,
+                                message,
+                                details: Some(details),
+                            };
+                            emit_error(&app, &error);
+                            DownloadTerminalOutcome::Error(error)
                         }
                     }
                 }
@@ -984,30 +989,28 @@ pub async fn run_download(
                     } else {
                         tail_text(&stderr_text, 2000)
                     };
-                    emit_error(
-                        &app,
-                        &DownloadError {
-                            job_id,
-                            message: first_meaningful_line(&stderr_text)
-                                .unwrap_or_else(|| format!("yt-dlp exited with status {}", exit)),
-                            details: Some(details),
-                        },
-                    );
+                    let error = DownloadError {
+                        job_id,
+                        message: first_meaningful_line(&stderr_text)
+                            .unwrap_or_else(|| format!("yt-dlp exited with status {}", exit)),
+                        details: Some(details),
+                    };
+                    emit_error(&app, &error);
+                    DownloadTerminalOutcome::Error(error)
                 }
                 Err(err) => {
                     let message = format!("Download process failed: {}", err);
-                    emit_error(
-                        &app,
-                        &DownloadError {
-                            job_id,
-                            message: message.clone(),
-                            details: Some(if stderr_text.trim().is_empty() {
-                                message
-                            } else {
-                                tail_text(&stderr_text, 2000)
-                            }),
-                        },
-                    );
+                    let error = DownloadError {
+                        job_id,
+                        message: message.clone(),
+                        details: Some(if stderr_text.trim().is_empty() {
+                            message
+                        } else {
+                            tail_text(&stderr_text, 2000)
+                        }),
+                    };
+                    emit_error(&app, &error);
+                    DownloadTerminalOutcome::Error(error)
                 }
             }
         }
@@ -1021,6 +1024,10 @@ pub async fn run_download(
             let _ = stderr_task.await;
             let _ = std::fs::remove_file(&final_path_file);
             emit_cancelled(&app, job_id);
+            DownloadTerminalOutcome::Cancelled(DownloadCancelled {
+                job_id,
+                message: "Download cancelled.".to_string(),
+            })
         }
     }
 }

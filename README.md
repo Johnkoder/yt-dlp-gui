@@ -55,6 +55,17 @@ tool yt-dlp uses for merging separate streams and future conversion.
   binary, missing Deno) with stderr details in the UI
 - FIFO queue owns ordering with exactly one active yt-dlp job, so
   concurrent downloads can't collide
+- Persistent download history: terminal outcomes (`Completed`, `Failed`,
+  `Cancelled`) are persisted across app launches in a lightweight, versioned
+  JSON file (`history.json`) in the local app data folder. The active queue
+  remains strictly session-only (never restored on restart)
+- History entries are displayed newest first with status badges, media/quality
+  summaries, localized timestamps, error/cancellation details, and an **Open
+  Folder** button for successful downloads
+- Atomic, defensive storage with automatic backup upon corruption or schema
+  version mismatch, isolated so storage failures never block downloads
+- Safe **Clear History** button with confirmation that clears record history
+  without ever deleting downloaded media files or directories on disk
 
 ## Tech stack
 
@@ -224,7 +235,7 @@ cargo test             # needs MSVC link.exe on Windows
 
 - One active download at a time (FIFO queue sequential execution).
 - Whole-window scrolling; queue entries are session-only and cleared upon reload.
-- No subtitles, history, settings, or updater UI yet.
+- No subtitles, settings, or updater UI yet.
 - Full linking and `cargo test` of the Tauri crate require MSVC; with
   only a GNU toolchain, `cargo check`/`clippy` still validate the code.
 - The placeholder `icon.icns` is bundle filler for non-Windows targets;
@@ -243,9 +254,10 @@ Completed:
   auto-continue, session-only)
 - playlist support (explicit Single item / Playlist scope selector, flat
   discovery, queue expansion preserving order, skipped item accounting)
+- persistent download history (versioned JSON storage, terminal outcome
+  logging, newest-first UI, live updates, safe clear)
 
 Possible next:
-- history
 - subtitles selection
 - dependency setup assistance
 etc.

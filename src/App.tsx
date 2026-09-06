@@ -5,12 +5,14 @@ import { DownloadButton } from "./components/DownloadButton";
 import { MediaTypeSelector } from "./components/MediaTypeSelector";
 import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
+import { HistorySection } from "./components/HistorySection";
 import { QueueSection } from "./components/QueueSection";
 import { ScopeSelector } from "./components/ScopeSelector";
 import { UrlInput } from "./components/UrlInput";
 import { AUDIO_FORMAT_LABELS } from "./features/downloads/options";
 import { useDependencies } from "./features/dependencies/hooks/useDependencies";
 import { useDownloadQueue } from "./features/downloads/hooks/useDownloadQueue";
+import { useHistory } from "./features/history/hooks/useHistory";
 import "./App.css";
 
 export default function App() {
@@ -40,6 +42,7 @@ export default function App() {
   } = useDownloadQueue();
 
   const dependencies = useDependencies();
+  const history = useHistory();
 
   const isInitializing = initStatus === "initializing";
   const initFailed = initStatus === "error";
@@ -214,6 +217,13 @@ export default function App() {
           onRemove={(jobId) => {
             void handleJobCancel(jobId);
           }}
+        />
+
+        <HistorySection
+          entries={history.entries}
+          isClearing={history.isClearing}
+          clearError={history.clearError}
+          onClearHistory={history.clearAllHistory}
         />
 
         <DependencySection

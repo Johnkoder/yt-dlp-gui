@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{watch, Mutex};
 
 use crate::services::ytdlp::{self, is_valid_http_url, StartDownloadRequest};
@@ -330,23 +330,49 @@ async fn queue_worker(app: AppHandle, inner: Arc<Mutex<DownloadControl>>) {
         // Revalidate at execution time: folders may vanish and tools may
         // disappear while the job waits. A stale job errors WITHOUT
         // launching yt-dlp, then the queue continues.
-        match ytdlp::validate_request(&request) {
+        let outcome = match ytdlp::validate_request(&request) {
             Err(message) => {
-                let _ = app.emit(
-                    ytdlp::ERROR_EVENT,
-                    ytdlp::DownloadError {
-                        job_id: id,
-                        message: message.clone(),
-                        details: Some(message),
-                    },
-                );
+                let error = ytdlp::DownloadError {
+                    job_id: id,
+                    message: message.clone(),
+                    details: Some(message),
+                };
+                let _ = app.emit(ytdlp::ERROR_EVENT, &error);
+                ytdlp::DownloadTerminalOutcome::Error(error)
             }
-            Ok(options) => {
-                ytdlp::run_download(app.clone(), id, options, cancel_rx).await;
-            }
-        }
+            Ok(options) => ytdlp::run_download(app.clone(), id, options, cancel_rx).await,
+        };
+
+        record_terminal_history(&app, &request, &outcome).await;
 
         inner.lock().await.finish(id);
+    }
+}
+
+async fn record_terminal_history(
+    app: &AppHandle,
+    request: &ytdlp::StartDownloadRequest,
+    outcome: &ytdlp::DownloadTerminalOutcome,
+) {
+    if let Some(history_state) = app.try_state::<crate::services::history::HistoryState>() {
+        match history_state.get_manager(app).await {
+            Ok(mut guard) => {
+                if let Some(manager) = guard.as_mut() {
+                    match manager.record(request, outcome) {
+                        Ok(entry) => {
+                            let _ = app
+                                .emit(crate::services::history::HISTORY_ENTRY_ADDED_EVENT, entry);
+                        }
+                        Err(err) => {
+                            eprintln!("Failed to write history record: {err}");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("Failed to acquire history manager: {err}");
+            }
+        }
     }
 }
 

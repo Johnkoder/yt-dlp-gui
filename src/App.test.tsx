@@ -6,6 +6,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
 import type { DependencyReport } from "./features/dependencies/types";
+import type { HistoryEntry } from "./features/history/types";
 
 const { mockInvoke, mockListen, mockDialogOpen } = vi.hoisted(() => ({
   mockInvoke: vi.fn(),
@@ -54,6 +55,7 @@ const backend = {
   enqueueIds: [1, 2, 3, 4, 5, 6, 7, 8, 9],
   cancelOutcome: "cancelling" as "cancelling" | "removed" | "notFound",
   failEnqueueWith: null as string | null,
+  history: [] as HistoryEntry[],
 };
 
 function activeListen(handlers?: Map<string, Handler>) {
@@ -102,6 +104,13 @@ function defaultAnswer(command: string, args?: unknown) {
   if (command === "cancel_job") {
     return Promise.resolve(backend.cancelOutcome);
   }
+  if (command === "get_history") {
+    return Promise.resolve(backend.history);
+  }
+  if (command === "clear_history") {
+    backend.history = [];
+    return Promise.resolve();
+  }
   return Promise.resolve(undefined);
 }
 
@@ -132,6 +141,7 @@ beforeEach(() => {
   backend.enqueueIds = [1, 2, 3, 4, 5, 6, 7, 8, 9];
   backend.cancelOutcome = "cancelling";
   backend.failEnqueueWith = null;
+  backend.history = [];
   mockInvoke.mockImplementation(defaultAnswer);
 });
 
@@ -811,5 +821,96 @@ describe("App dependencies", () => {
     expect(
       screen.getByText(/Added 2 items\. 1 unavailable entry was skipped\./i),
     ).toBeInTheDocument();
+  });
+
+  describe("History section integration", () => {
+    it("renders empty history state when no items exist", async () => {
+      await renderReadyApp();
+      expect(screen.getByRole("region", { name: /download history/i })).toBeInTheDocument();
+      expect(screen.getByText("No download history yet.")).toBeInTheDocument();
+    });
+
+    it("displays loaded history items", async () => {
+      backend.history = [
+        {
+          id: 1,
+          timestampMs: 1672531199000,
+          url: "https://example.com/item",
+          mediaType: "video",
+          quality: "1080",
+          audioFormat: null,
+          outputDirectory: DEFAULT_DIR,
+          status: "success",
+          filename: "saved_video.mp4",
+          filepath: `${DEFAULT_DIR}\\saved_video.mp4`,
+          message: null,
+        },
+      ];
+
+      await renderReadyApp();
+
+      expect(screen.getByText("saved_video.mp4")).toBeInTheDocument();
+      expect(screen.getByText("Video • 1080p")).toBeInTheDocument();
+      expect(screen.getByText("Completed")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /open folder/i })).toBeInTheDocument();
+    });
+
+    it("updates dynamically when history-entry-added event arrives", async () => {
+      const handlers = new Map<string, Handler>();
+      await renderReadyApp(handlers);
+
+      expect(screen.getByText("No download history yet.")).toBeInTheDocument();
+
+      const newEntry: HistoryEntry = {
+        id: 99,
+        timestampMs: 1672531200000,
+        url: "https://example.com/live",
+        mediaType: "audio",
+        quality: null,
+        audioFormat: "mp3",
+        outputDirectory: DEFAULT_DIR,
+        status: "error",
+        filename: null,
+        filepath: null,
+        message: "Network failure",
+      };
+
+      await fire(handlers, "history-entry-added", newEntry);
+
+      expect(screen.queryByText("No download history yet.")).not.toBeInTheDocument();
+      expect(screen.getByText("Audio • MP3")).toBeInTheDocument();
+      expect(screen.getByText("Failed")).toBeInTheDocument();
+      expect(screen.getByText("Network failure")).toBeInTheDocument();
+    });
+
+    it("clears history when confirmed", async () => {
+      backend.history = [
+        {
+          id: 1,
+          timestampMs: 1672531199000,
+          url: "https://example.com/item",
+          mediaType: "video",
+          quality: "best",
+          audioFormat: null,
+          outputDirectory: DEFAULT_DIR,
+          status: "success",
+          filename: "video_to_clear.mp4",
+          filepath: null,
+          message: null,
+        },
+      ];
+
+      await renderReadyApp();
+      expect(screen.getByText("video_to_clear.mp4")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /clear history/i }));
+      expect(screen.getByText("Clear all history?")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+      await act(async () => {});
+
+      expect(mockInvoke).toHaveBeenCalledWith("clear_history");
+      expect(screen.getByText("No download history yet.")).toBeInTheDocument();
+    });
   });
 });
