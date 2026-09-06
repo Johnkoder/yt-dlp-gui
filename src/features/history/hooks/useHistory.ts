@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { HistoryEntry } from "../types";
 import {
   clearHistory as apiClearHistory,
@@ -24,20 +24,24 @@ export function useHistory(): UseHistoryReturn {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isClearing, setIsClearing] = useState<boolean>(false);
   const [clearError, setClearError] = useState<string | null>(null);
+  const clearBarrierRef = useRef<number>(0);
 
   const fetchHistory = useCallback(async () => {
     try {
       const loaded = await getHistory();
       setEntries((prev) => {
+        const barrier = clearBarrierRef.current;
+        const eligiblePrev = prev.filter((entry) => entry.id >= barrier);
+        const eligibleLoaded = loaded.filter((entry) => entry.id >= barrier);
         const seen = new Set<number>();
         const merged: HistoryEntry[] = [];
-        for (const e of prev) {
+        for (const e of eligiblePrev) {
           if (!seen.has(e.id)) {
             seen.add(e.id);
             merged.push(e);
           }
         }
-        for (const e of loaded) {
+        for (const e of eligibleLoaded) {
           if (!seen.has(e.id)) {
             seen.add(e.id);
             merged.push(e);
@@ -61,6 +65,9 @@ export function useHistory(): UseHistoryReturn {
 
     subscribeToHistoryEvents((newEntry: HistoryEntry) => {
       if (cancelled) return;
+      if (newEntry.id < clearBarrierRef.current) {
+        return;
+      }
       setEntries((prev) => {
         if (prev.some((e) => e.id === newEntry.id)) {
           return prev;
@@ -94,7 +101,13 @@ export function useHistory(): UseHistoryReturn {
     setClearError(null);
     try {
       const result = await apiClearHistory();
-      setEntries((prev) => prev.filter((entry) => entry.id >= result.nextId));
+      clearBarrierRef.current = Math.max(
+        clearBarrierRef.current,
+        result.nextId,
+      );
+      setEntries((prev) =>
+        prev.filter((entry) => entry.id >= clearBarrierRef.current),
+      );
       return true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
