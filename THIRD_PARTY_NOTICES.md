@@ -7,13 +7,33 @@ license text can be found. It is not legal advice.
 
 ## Bundled at build/runtime
 
-### yt-dlp
-- What: the underlying media downloader; `yt-dlp.exe` is fetched from the
-  official upstream release (see `scripts/ytdlp-version.json`) and bundled
-  into packaged builds as an application resource.
+### yt-dlp (source project)
+- What: the underlying media downloader. This GUI fetches the official
+  prebuilt `yt-dlp.exe` at build setup time (see
+  `scripts/ytdlp-version.json`) and bundles it into packaged builds as an
+  application resource. The GUI launches it as a separate child process
+  and incorporates no yt-dlp source code.
 - Upstream: https://github.com/yt-dlp/yt-dlp
-- License: **The Unlicense** (public-domain dedication).
+- Source license: **The Unlicense** (public-domain dedication).
   Full text: https://github.com/yt-dlp/yt-dlp/blob/master/LICENSE
+
+### yt-dlp official prebuilt executable (what is actually redistributed)
+- The official PyInstaller-bundled executables are **not** covered by the
+  Unlicense alone. Per the [official 2026.08.19 release notes](https://github.com/yt-dlp/yt-dlp/releases/tag/2026.08.19):
+  the release tarball/zipimport binary contain ISC/MIT code, while the
+  PyInstaller-bundled executables "are subject to these and other
+  licenses, all of which are compiled in THIRD_PARTY_LICENSES.txt".
+  That upstream file lists components under permissive licenses as well
+  as GPL/LGPL-family licenses (including GPL-3.0-or-later and
+  GPL-2.0-or-later entries) — consult it as the authoritative list.
+- The exact upstream file for the pinned release is vendored verbatim at
+  `third-party/yt-dlp/THIRD_PARTY_LICENSES.txt` (see
+  `third-party/yt-dlp/README.md` for version, source commit, and URL) and
+  is included in packaged builds alongside the application so
+  redistributions carry the applicable upstream notices.
+- This GUI project itself stays MIT-licensed: it is a separate program
+  that invokes the official executable as a child process. This note is
+  not legal advice.
 
 ## Application framework and UI libraries
 

@@ -41,6 +41,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/bin/yt-dlp.exe"]
+    "resources": [
+      "resources/bin/yt-dlp.exe",
+      "../third-party/yt-dlp/THIRD_PARTY_LICENSES.txt"
+    ]
   }
 }

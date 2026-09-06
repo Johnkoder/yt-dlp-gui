@@ -305,8 +305,7 @@ mod tests {
         // the enqueue command turns that into the friendly "no downloadable
         // items" error instead of queueing anything.
         let discovery =
-            parse_playlist_json(&serde_json::to_string(&bad).expect("json"))
-                .expect("parses");
+            parse_playlist_json(&serde_json::to_string(&bad).expect("json")).expect("parses");
         assert!(discovery.entries.is_empty());
         assert_eq!(discovery.skipped, 1);
 
