@@ -5,8 +5,11 @@ import {
   DOWNLOAD_ERROR_EVENT,
   DOWNLOAD_PROGRESS_EVENT,
   DOWNLOAD_STARTED_EVENT,
+  enqueueDownload,
+  enqueuePlaylist,
   subscribeToDownloadEvents,
 } from "./downloadService";
+import { invoke } from "@tauri-apps/api/core";
 
 const { mockListen } = vi.hoisted(() => ({
   mockListen: vi.fn(),
@@ -157,5 +160,86 @@ describe("subscribeToDownloadEvents", () => {
     for (const unlisten of unlistens) {
       expect(unlisten).toHaveBeenCalledTimes(1);
     }
+  });
+});
+
+describe("enqueueDownload", () => {
+  it("rejects empty URL", async () => {
+    await expect(
+      enqueueDownload({
+        url: "   ",
+        mediaType: "video",
+        quality: "best",
+        audioFormat: null,
+        outputDirectory: "C:\\Downloads",
+      }),
+    ).rejects.toThrow("Please paste a video URL first.");
+  });
+
+  it("invokes enqueue_download with trimmed URL", async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ jobId: 42 });
+
+    const result = await enqueueDownload({
+      url: "  https://example.com/watch?v=1  ",
+      mediaType: "video",
+      quality: "best",
+      audioFormat: null,
+      outputDirectory: "C:\\Downloads",
+    });
+
+    expect(invoke).toHaveBeenCalledWith("enqueue_download", {
+      request: {
+        url: "https://example.com/watch?v=1",
+        mediaType: "video",
+        quality: "best",
+        audioFormat: null,
+        outputDirectory: "C:\\Downloads",
+      },
+    });
+    expect(result).toEqual({ jobId: 42 });
+  });
+});
+
+describe("enqueuePlaylist", () => {
+  it("rejects empty URL", async () => {
+    await expect(
+      enqueuePlaylist({
+        url: "   ",
+        mediaType: "video",
+        quality: "best",
+        audioFormat: null,
+        outputDirectory: "C:\\Downloads",
+      }),
+    ).rejects.toThrow("Please paste a playlist URL first.");
+  });
+
+  it("invokes enqueue_playlist with trimmed URL and returns batch items", async () => {
+    const mockBatch = {
+      items: [
+        { jobId: 1, url: "https://example.com/watch?v=1", title: "Item 1" },
+        { jobId: 2, url: "https://example.com/watch?v=2", title: "Item 2" },
+      ],
+      skippedCount: 1,
+    };
+    vi.mocked(invoke).mockResolvedValueOnce(mockBatch);
+
+    const result = await enqueuePlaylist({
+      url: "  https://example.com/playlist?list=XYZ  ",
+      mediaType: "video",
+      quality: "1080",
+      audioFormat: null,
+      outputDirectory: "C:\\Downloads",
+    });
+
+    expect(invoke).toHaveBeenCalledWith("enqueue_playlist", {
+      request: {
+        url: "https://example.com/playlist?list=XYZ",
+        mediaType: "video",
+        quality: "1080",
+        audioFormat: null,
+        outputDirectory: "C:\\Downloads",
+      },
+    });
+    expect(result).toEqual(mockBatch);
   });
 });

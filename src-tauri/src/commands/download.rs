@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::{watch, Mutex};
 
-use crate::services::ytdlp::{self, StartDownloadRequest};
+use crate::services::ytdlp::{self, is_valid_http_url, StartDownloadRequest};
 
 /// One waiting job: an ID plus the immutable request snapshot taken at
 /// enqueue time. Later form edits can never mutate it.
@@ -70,6 +70,24 @@ impl DownloadControl {
             self.worker_running = true;
         }
         (id, spawn_worker)
+    }
+
+    /// Accept a validated batch in playlist order. IDs stay monotonic, every
+    /// job lands in order, and the worker-spawn decision is made exactly
+    /// once — never one worker per item.
+    fn enqueue_batch(&mut self, requests: Vec<StartDownloadRequest>) -> (Vec<u64>, bool) {
+        let mut ids = Vec::with_capacity(requests.len());
+        for request in requests {
+            let id = self.next_id;
+            self.next_id += 1;
+            ids.push(id);
+            self.queued.push_back(QueuedDownload { id, request });
+        }
+        let spawn_worker = !self.worker_running;
+        if spawn_worker {
+            self.worker_running = true;
+        }
+        (ids, spawn_worker)
     }
 
     /// Promote the front job to active, installing its cancellation channel.
@@ -149,11 +167,6 @@ impl Default for DownloadState {
     }
 }
 
-fn is_valid_http_url(url: &str) -> bool {
-    let lower = url.to_ascii_lowercase();
-    (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() <= 2048
-}
-
 /// Accept a download request into the FIFO queue. The request is fully
 /// validated up front (URL, media/quality/format combinations, output
 /// folder, yt-dlp resource, FFmpeg requirement) so obviously invalid jobs
@@ -189,6 +202,87 @@ pub async fn enqueue_download(
     }
 
     Ok(EnqueueResult { job_id })
+}
+
+/// One expanded playlist child: its backend job ID plus the resolved item
+/// URL, so the frontend can rebuild each child's full request snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEnqueueItem {
+    pub job_id: u64,
+    pub url: String,
+    pub title: Option<String>,
+}
+
+/// Batch answer: every accepted child in playlist order, plus how many raw
+/// entries had to be skipped.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistEnqueueResult {
+    pub items: Vec<PlaylistEnqueueItem>,
+    pub skipped_count: usize,
+}
+
+/// Expand a playlist URL into normal FIFO queue jobs sharing one common
+/// request snapshot (media type, quality, audio format, output folder).
+///
+/// Flow is all-discovery-first, then one atomic batch enqueue: an
+/// extraction failure can never leave a half-added playlist behind.
+/// Afterwards the existing worker treats every child like any manual job —
+/// same validation, same argv builder, same single active download.
+#[tauri::command]
+pub async fn enqueue_playlist(
+    app: AppHandle,
+    state: State<'_, DownloadState>,
+    request: StartDownloadRequest,
+) -> Result<PlaylistEnqueueResult, String> {
+    if !is_valid_http_url(request.url.trim()) {
+        return Err("That does not look like a valid http(s) URL.".to_string());
+    }
+    ytdlp::resolve_ytdlp_path(&app)?;
+
+    // Upfront validation of the COMMON settings (bad combos, missing
+    // folder, missing FFmpeg for conversions): reject before spending
+    // time on extraction or queueing unusable jobs.
+    ytdlp::validate_request(&request)?;
+
+    let discovery = crate::services::playlist::discover_entries(&app, request.url.trim()).await?;
+    if discovery.entries.is_empty() {
+        return Err(
+            "This playlist has no downloadable items. Unavailable or private entries were skipped."
+                .to_string(),
+        );
+    }
+
+    let (spawn_worker, items) = {
+        let mut control = state.inner.lock().await;
+        let child_requests: Vec<StartDownloadRequest> = discovery
+            .entries
+            .iter()
+            .map(|entry| crate::services::playlist::child_request(&request, entry.url.clone()))
+            .collect();
+        let (ids, spawn_worker) = control.enqueue_batch(child_requests);
+        let items: Vec<PlaylistEnqueueItem> = ids
+            .into_iter()
+            .zip(discovery.entries.iter())
+            .map(|(job_id, entry)| PlaylistEnqueueItem {
+                job_id,
+                url: entry.url.clone(),
+                title: entry.title.clone(),
+            })
+            .collect();
+        (spawn_worker, items)
+    };
+
+    if spawn_worker {
+        let inner = state.inner.clone();
+        tokio::spawn(queue_worker(app, inner));
+    }
+
+    Ok(PlaylistEnqueueResult {
+        items,
+        skipped_count: discovery.skipped,
+    })
 }
 
 /// Cancel or remove a queued job by its backend ID.
@@ -478,6 +572,106 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EnqueueResult { job_id: 17 }).expect("serializes"),
             serde_json::json!({ "jobId": 17 })
+        );
+    }
+
+    #[test]
+    fn batch_enqueue_appends_in_order_with_one_spawn() {
+        // Existing X, Y plus batch A, B, C → X, Y, A, B, C with IDs
+        // mapping exactly onto the batch order.
+        let mut control = DownloadControl::default();
+        let (x, _) = control.enqueue(video_request("https://x.example/"));
+        let (y, _) = control.enqueue(video_request("https://y.example/"));
+        let batch: Vec<StartDownloadRequest> = ["a", "b", "c"]
+            .iter()
+            .map(|name| video_request(&format!("https://{}.example/", name)))
+            .collect();
+        let (ids, spawn) = control.enqueue_batch(batch);
+        assert_eq!(ids.len(), 3);
+        assert!(spawn, "idle worker must be requested once");
+        assert_eq!(
+            control.queued_ids(),
+            vec![x, y, ids[0], ids[1], ids[2]],
+            "batch appends after existing jobs in order"
+        );
+        // A second batch while "running" requests no new worker.
+        let (ids2, spawn2) = control.enqueue_batch(vec![video_request("https://d.example/")]);
+        assert!(!spawn2, "no second worker while running");
+        assert_eq!(ids2.len(), 1);
+        assert!(ids2[0] > ids[2], "IDs keep increasing");
+    }
+
+    #[test]
+    fn batch_of_twenty_requests_single_worker() {
+        // A 20-item playlist batch on an empty queue: one spawn flag.
+        let mut control = DownloadControl::default();
+        let batch: Vec<StartDownloadRequest> = (0..20)
+            .map(|i| video_request(&format!("https://{}.example/", i)))
+            .collect();
+        let (ids, spawn) = control.enqueue_batch(batch);
+        assert_eq!(ids.len(), 20);
+        assert!(spawn);
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 20, "batch IDs unique");
+    }
+
+    #[test]
+    fn mixed_single_and_batch_ids_stay_unique_monotonic() {
+        // single A, batch B/C/D, single E: unique, ever-increasing IDs.
+        let mut control = DownloadControl::default();
+        let (a, _) = control.enqueue(video_request("https://a.example/"));
+        let (batch_ids, _) = control.enqueue_batch(
+            ["b", "c", "d"]
+                .iter()
+                .map(|name| video_request(&format!("https://{}.example/", name)))
+                .collect(),
+        );
+        let (e, _) = control.enqueue(video_request("https://e.example/"));
+        let all = std::iter::once(a)
+            .chain(batch_ids.clone())
+            .chain(std::iter::once(e))
+            .collect::<Vec<_>>();
+        assert_eq!(all, vec![a, batch_ids[0], batch_ids[1], batch_ids[2], e]);
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 5, "no ID reuse across single/batch");
+        assert!(all.windows(2).all(|pair| pair[0] < pair[1]), "monotonic");
+        assert_eq!(
+            control.queued_ids(),
+            all,
+            "queue order matches acceptance order"
+        );
+    }
+
+    #[test]
+    fn playlist_result_serializes_for_typescript() {
+        let result = PlaylistEnqueueResult {
+            items: vec![
+                PlaylistEnqueueItem {
+                    job_id: 10,
+                    url: "https://example.com/watch?v=A".to_string(),
+                    title: Some("A".to_string()),
+                },
+                PlaylistEnqueueItem {
+                    job_id: 11,
+                    url: "https://example.com/watch?v=B".to_string(),
+                    title: None,
+                },
+            ],
+            skipped_count: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(&result).expect("serializes"),
+            serde_json::json!({
+                "items": [
+                    {"jobId": 10, "url": "https://example.com/watch?v=A", "title": "A"},
+                    {"jobId": 11, "url": "https://example.com/watch?v=B", "title": null},
+                ],
+                "skippedCount": 2,
+            })
         );
     }
 

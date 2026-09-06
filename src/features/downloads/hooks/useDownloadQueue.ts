@@ -3,6 +3,7 @@ import {
   cancelJob,
   chooseOutputDirectory,
   enqueueDownload,
+  enqueuePlaylist,
   friendlyErrorMessage,
   getDownloadsDir,
   subscribeToDownloadEvents,
@@ -29,6 +30,7 @@ import type {
   DownloadResult,
   DownloadStartedEvent,
   DownloadJob,
+  DownloadScope,
   EventSubscription,
   InitStatus,
   JobStatus,
@@ -39,6 +41,8 @@ export interface UseQueueState {
   subscription: EventSubscription;
   url: string;
   setUrl: (url: string) => void;
+  scope: DownloadScope;
+  setScope: (scope: DownloadScope) => void;
   mediaType: MediaType;
   setMediaType: (mediaType: MediaType) => void;
   quality: VideoQuality;
@@ -53,6 +57,7 @@ export interface UseQueueState {
   jobs: DownloadJob[];
   isSubmitting: boolean;
   enqueueError: string | null;
+  enqueueNotice: string | null;
   initErrorMessage: string | null;
   initErrorDetails: string | null;
   canEnqueue: boolean;
@@ -95,6 +100,7 @@ export function useDownloadQueue(): UseQueueState {
   const [subscription, setSubscription] =
     useState<EventSubscription>("pending");
   const [url, setUrlState] = useState("");
+  const [scope, setScopeState] = useState<DownloadScope>("single");
   const [mediaType, setMediaTypeState] =
     useState<MediaType>(DEFAULT_MEDIA_TYPE);
   const [quality, setQualityState] = useState<VideoQuality>(
@@ -109,6 +115,7 @@ export function useDownloadQueue(): UseQueueState {
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [enqueueError, setEnqueueError] = useState<string | null>(null);
+  const [enqueueNotice, setEnqueueNotice] = useState<string | null>(null);
   const [initErrorMessage, setInitErrorMessage] = useState<string | null>(null);
   const [initErrorDetails, setInitErrorDetails] = useState<string | null>(null);
 
@@ -372,6 +379,10 @@ export function useDownloadQueue(): UseQueueState {
     setUrlState(value);
   }, []);
 
+  const setScope = useCallback((value: DownloadScope) => {
+    setScopeState(value);
+  }, []);
+
   const setMediaType = useCallback((value: MediaType) => {
     setMediaTypeState(value);
   }, []);
@@ -454,40 +465,96 @@ export function useDownloadQueue(): UseQueueState {
       audioFormat,
       destination,
     );
-    pendingRef.current = snapshot;
     submittingRef.current = true;
     setIsSubmitting(true);
     setEnqueueError(null);
-    try {
-      const { jobId } = await enqueueDownload(snapshot);
-      const taken = pendingRef.current;
-      pendingRef.current = null;
-      setJobs((prev) => {
-        const index = prev.findIndex((job) => job.id === jobId);
-        if (index !== -1) {
-          // Started event won the race: fold the snapshot in, keep the
-          // downloading status — never regress it to queued.
-          const job = prev[index];
-          if (job.request) {
-            return prev;
+    setEnqueueNotice(null);
+
+    if (scope === "single") {
+      pendingRef.current = snapshot;
+      try {
+        const { jobId } = await enqueueDownload(snapshot);
+        const taken = pendingRef.current;
+        pendingRef.current = null;
+        setJobs((prev) => {
+          const index = prev.findIndex((job) => job.id === jobId);
+          if (index !== -1) {
+            // Started event won the race: fold the snapshot in, keep the
+            // downloading status — never regress it to queued.
+            const job = prev[index];
+            if (job.request) {
+              return prev;
+            }
+            const next = [...prev];
+            next[index] = { ...job, request: taken };
+            return next;
           }
+          return [...prev, emptyJob(jobId, taken, "queued")];
+        });
+        // Clear the URL for convenient next entry; selections persist.
+        setUrlState("");
+      } catch (err: unknown) {
+        pendingRef.current = null;
+        const raw = err instanceof Error ? err.message : String(err);
+        setEnqueueError(friendlyErrorMessage(raw, mediaType));
+      } finally {
+        submittingRef.current = false;
+        setIsSubmitting(false);
+      }
+    } else {
+      // Playlist scope: pendingRef is deliberately NOT used so single-item
+      // enqueues are never corrupted or misattributed.
+      try {
+        const result = await enqueuePlaylist(snapshot);
+        setJobs((prev) => {
           const next = [...prev];
-          next[index] = { ...job, request: taken };
+          for (const item of result.items) {
+            const childRequest: DownloadRequest = {
+              ...snapshot,
+              url: item.url,
+            };
+            const existingIndex = next.findIndex((job) => job.id === item.jobId);
+            if (existingIndex !== -1) {
+              // Started event or early progress event won the race and created a
+              // placeholder row: enrich it with the request snapshot without
+              // regressing its lifecycle status (downloading/completed/etc).
+              const existingJob = next[existingIndex];
+              next[existingIndex] = {
+                ...existingJob,
+                request: existingJob.request ?? childRequest,
+              };
+            } else {
+              next.push(emptyJob(item.jobId, childRequest, "queued"));
+            }
+          }
           return next;
+        });
+
+        if (result.skippedCount > 0) {
+          setEnqueueNotice(
+            `Added ${result.items.length} ${
+              result.items.length === 1 ? "item" : "items"
+            }. ${result.skippedCount} unavailable ${
+              result.skippedCount === 1 ? "entry was" : "entries were"
+            } skipped.`,
+          );
+        } else {
+          setEnqueueNotice(
+            `Added ${result.items.length} playlist ${
+              result.items.length === 1 ? "item" : "items"
+            } to the queue.`,
+          );
         }
-        return [...prev, emptyJob(jobId, taken, "queued")];
-      });
-      // Clear the URL for convenient next entry; selections persist.
-      setUrlState("");
-    } catch (err: unknown) {
-      pendingRef.current = null;
-      const raw = err instanceof Error ? err.message : String(err);
-      setEnqueueError(friendlyErrorMessage(raw, mediaType));
-    } finally {
-      submittingRef.current = false;
-      setIsSubmitting(false);
+        setUrlState("");
+      } catch (err: unknown) {
+        const raw = err instanceof Error ? err.message : String(err);
+        setEnqueueError(friendlyErrorMessage(raw, mediaType));
+      } finally {
+        submittingRef.current = false;
+        setIsSubmitting(false);
+      }
     }
-  }, [url, mediaType, quality, audioFormat]);
+  }, [url, mediaType, quality, audioFormat, scope]);
 
   const handleJobCancel = useCallback(async (jobId: number) => {
     const job = jobsRef.current.find((candidate) => candidate.id === jobId);
@@ -573,6 +640,8 @@ export function useDownloadQueue(): UseQueueState {
     subscription,
     url,
     setUrl,
+    scope,
+    setScope,
     mediaType,
     setMediaType,
     quality,
@@ -585,6 +654,7 @@ export function useDownloadQueue(): UseQueueState {
     jobs,
     isSubmitting,
     enqueueError,
+    enqueueNotice,
     initErrorMessage,
     initErrorDetails,
     canEnqueue,

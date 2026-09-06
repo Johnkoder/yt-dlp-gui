@@ -60,6 +60,10 @@
   color: var(--error);
 }
 
+.hint--info {
+  color: var(--accent);
+}
+
 .app-footer {
   margin-top: auto;
   padding-top: 12px;

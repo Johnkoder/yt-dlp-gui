@@ -38,6 +38,19 @@ function setupActive(nextJobId: { value: number }) {
       nextJobId.value += 1;
       return Promise.resolve({ jobId });
     }
+    if (command === "enqueue_playlist") {
+      const id1 = nextJobId.value++;
+      const id2 = nextJobId.value++;
+      const id3 = nextJobId.value++;
+      return Promise.resolve({
+        items: [
+          { jobId: id1, url: "https://example.com/watch?v=A", title: "A" },
+          { jobId: id2, url: "https://example.com/watch?v=B", title: "B" },
+          { jobId: id3, url: "https://example.com/watch?v=C", title: "C" },
+        ],
+        skippedCount: 0,
+      });
+    }
     if (command === "cancel_job") {
       return Promise.resolve("cancelling");
     }
@@ -514,5 +527,367 @@ describe("useDownloadQueue", () => {
     expect(result.current.enqueueError).toMatch(/yt-dlp is required/);
     // URL preserved for correction and retry.
     expect(result.current.url).toBe("https://example.com/a");
+  });
+
+  it("defaults scope to single", async () => {
+    setupActive({ value: 1 });
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    expect(result.current.scope).toBe("single");
+  });
+
+  it("playlist request invokes enqueue_playlist and NOT enqueue_download", async () => {
+    setupActive({ value: 1 });
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist?list=XYZ");
+      result.current.setMediaType("video");
+      result.current.setQuality("1080");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_playlist", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("enqueue_download", expect.anything());
+  });
+
+  it("single request invokes enqueue_download and NOT enqueue_playlist", async () => {
+    setupActive({ value: 1 });
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("single");
+      result.current.setUrl("https://example.com/watch?v=ABC&list=XYZ");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_download", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("enqueue_playlist", expect.anything());
+  });
+
+  it("playlist response creates jobs in order inheriting common options with individual URLs", async () => {
+    setupActive({ value: 10 });
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist?list=XYZ");
+      result.current.setMediaType("video");
+      result.current.setQuality("720");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+
+    expect(result.current.jobs).toHaveLength(3);
+    const [j1, j2, j3] = result.current.jobs;
+    expect(j1.id).toBe(10);
+    expect(j1.request?.url).toBe("https://example.com/watch?v=A");
+    expect(j1.request?.quality).toBe("720");
+    expect(j1.status).toBe("queued");
+
+    expect(j2.id).toBe(11);
+    expect(j2.request?.url).toBe("https://example.com/watch?v=B");
+    expect(j2.request?.quality).toBe("720");
+
+    expect(j3.id).toBe(12);
+    expect(j3.request?.url).toBe("https://example.com/watch?v=C");
+    expect(j3.request?.quality).toBe("720");
+
+    expect(result.current.enqueueNotice).toMatch(/Added 3 playlist items to the queue/);
+    expect(result.current.url).toBe("");
+  });
+
+  it("playlist event before response race merges in place without status regression", async () => {
+    let resolvePlaylist!: (val: unknown) => void;
+    const playlistPromise = new Promise((resolve) => {
+      resolvePlaylist = resolve;
+    });
+    const handlers = setupActive({ value: 10 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_playlist") return playlistPromise;
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist?list=XYZ");
+      result.current.setMediaType("video");
+      result.current.setQuality("1080");
+    });
+
+    let submitPromise!: Promise<void>;
+    act(() => {
+      submitPromise = result.current.enqueueCurrentDraft();
+    });
+
+    // Event for job 10 arrives BEFORE playlist response
+    await fire(handlers, "download-started", { jobId: 10 });
+    expect(result.current.jobs).toHaveLength(1);
+    expect(result.current.jobs[0].id).toBe(10);
+    expect(result.current.jobs[0].status).toBe("downloading");
+    expect(result.current.jobs[0].request).toBeNull();
+
+    // Now resolve playlist response
+    await act(async () => {
+      resolvePlaylist({
+        items: [
+          { jobId: 10, url: "https://example.com/watch?v=A" },
+          { jobId: 11, url: "https://example.com/watch?v=B" },
+          { jobId: 12, url: "https://example.com/watch?v=C" },
+        ],
+        skippedCount: 0,
+      });
+      await submitPromise;
+    });
+
+    expect(result.current.jobs).toHaveLength(3);
+    // Job 10 remains downloading and received its request snapshot!
+    expect(result.current.jobs[0].id).toBe(10);
+    expect(result.current.jobs[0].status).toBe("downloading");
+    expect(result.current.jobs[0].request?.url).toBe("https://example.com/watch?v=A");
+    expect(result.current.jobs[0].request?.quality).toBe("1080");
+
+    // Jobs 11 and 12 are queued
+    expect(result.current.jobs[1].id).toBe(11);
+    expect(result.current.jobs[1].status).toBe("queued");
+    expect(result.current.jobs[1].request?.url).toBe("https://example.com/watch?v=B");
+
+    expect(result.current.jobs[2].id).toBe(12);
+    expect(result.current.jobs[2].status).toBe("queued");
+    expect(result.current.jobs[2].request?.url).toBe("https://example.com/watch?v=C");
+  });
+
+  it("mixed queue race: active single job does not steal or corrupt playlist state", async () => {
+    let resolvePlaylist!: (val: unknown) => void;
+    const playlistPromise = new Promise((resolve) => {
+      resolvePlaylist = resolve;
+    });
+    const handlers = setupActive({ value: 1 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_download") return Promise.resolve({ jobId: 1 });
+      if (command === "enqueue_playlist") return playlistPromise;
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    // Enqueue single job 1
+    act(() => {
+      result.current.setUrl("https://example.com/single");
+    });
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+    expect(result.current.jobs).toHaveLength(1);
+    expect(result.current.jobs[0].id).toBe(1);
+
+    // Job 1 starts downloading
+    await fire(handlers, "download-started", { jobId: 1 });
+    expect(result.current.jobs[0].status).toBe("downloading");
+
+    // Now submit playlist
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist?list=123");
+    });
+    let playlistSubmit!: Promise<void>;
+    act(() => {
+      playlistSubmit = result.current.enqueueCurrentDraft();
+    });
+
+    // While playlist is resolving, Job 1 finishes
+    await fire(handlers, "download-complete", {
+      jobId: 1,
+      filename: "single.mp4",
+      outputDir: TEST_DIR,
+    });
+    expect(result.current.jobs[0].status).toBe("success");
+
+    // Now playlist response resolves
+    await act(async () => {
+      resolvePlaylist({
+        items: [
+          { jobId: 2, url: "https://example.com/p1" },
+          { jobId: 3, url: "https://example.com/p2" },
+        ],
+        skippedCount: 0,
+      });
+      await playlistSubmit;
+    });
+
+    expect(result.current.jobs).toHaveLength(3);
+    expect(result.current.jobs[0].id).toBe(1);
+    expect(result.current.jobs[0].status).toBe("success");
+    expect(result.current.jobs[0].request?.url).toBe("https://example.com/single");
+
+    expect(result.current.jobs[1].id).toBe(2);
+    expect(result.current.jobs[1].status).toBe("queued");
+    expect(result.current.jobs[1].request?.url).toBe("https://example.com/p1");
+
+    expect(result.current.jobs[2].id).toBe(3);
+    expect(result.current.jobs[2].status).toBe("queued");
+    expect(result.current.jobs[2].request?.url).toBe("https://example.com/p2");
+  });
+
+  it("draft edits during playlist submission do not mutate submitted immutable snapshot", async () => {
+    let resolvePlaylist!: (val: unknown) => void;
+    const playlistPromise = new Promise((resolve) => {
+      resolvePlaylist = resolve;
+    });
+    setupActive({ value: 1 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_playlist") return playlistPromise;
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist");
+      result.current.setMediaType("video");
+      result.current.setQuality("1080");
+    });
+
+    let submitPromise!: Promise<void>;
+    act(() => {
+      submitPromise = result.current.enqueueCurrentDraft();
+    });
+
+    // User changes draft while submission is in-flight
+    act(() => {
+      result.current.setMediaType("audio");
+      result.current.setAudioFormat("mp3");
+    });
+
+    await act(async () => {
+      resolvePlaylist({
+        items: [{ jobId: 1, url: "https://example.com/item1" }],
+        skippedCount: 0,
+      });
+      await submitPromise;
+    });
+
+    expect(result.current.jobs).toHaveLength(1);
+    const req = result.current.jobs[0].request!;
+    expect(req.mediaType).toBe("video");
+    expect(req.quality).toBe("1080");
+    expect(req.audioFormat).toBeNull();
+  });
+
+  it("skipped unavailable entries show notice and queue only accepted jobs", async () => {
+    setupActive({ value: 1 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_playlist") {
+        return Promise.resolve({
+          items: [
+            { jobId: 1, url: "https://example.com/item1" },
+            { jobId: 2, url: "https://example.com/item2" },
+          ],
+          skippedCount: 3,
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist");
+    });
+
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+
+    expect(result.current.jobs).toHaveLength(2);
+    expect(result.current.enqueueNotice).toBe(
+      "Added 2 items. 3 unavailable entries were skipped.",
+    );
+  });
+
+  it("playlist failure surfaces friendly error without adding jobs or disturbing queue", async () => {
+    setupActive({ value: 1 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_playlist") {
+        return Promise.reject(new Error("This playlist is private."));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist");
+    });
+
+    await act(async () => {
+      await result.current.enqueueCurrentDraft();
+    });
+
+    expect(result.current.jobs).toHaveLength(0);
+    expect(result.current.enqueueError).toBe("This playlist is private.");
+    // URL preserved so user can edit it
+    expect(result.current.url).toBe("https://example.com/playlist");
+  });
+
+  it("playlist double submit guard: only one IPC request in flight", async () => {
+    let resolvePlaylist!: (val: unknown) => void;
+    const playlistPromise = new Promise((resolve) => {
+      resolvePlaylist = resolve;
+    });
+    setupActive({ value: 1 });
+    mockInvoke.mockImplementation((command: string) => {
+      if (command === "get_downloads_dir") return Promise.resolve(TEST_DIR);
+      if (command === "enqueue_playlist") return playlistPromise;
+      return Promise.resolve(undefined);
+    });
+
+    const { result } = renderHook(() => useDownloadQueue());
+    await act(async () => {});
+
+    act(() => {
+      result.current.setScope("playlist");
+      result.current.setUrl("https://example.com/playlist");
+    });
+
+    act(() => {
+      void result.current.enqueueCurrentDraft();
+      void result.current.enqueueCurrentDraft();
+    });
+
+    expect(
+      mockInvoke.mock.calls.filter((call) => call[0] === "enqueue_playlist"),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      resolvePlaylist({ items: [{ jobId: 1, url: "https://example.com/1" }], skippedCount: 0 });
+    });
+
+    expect(result.current.jobs).toHaveLength(1);
   });
 });

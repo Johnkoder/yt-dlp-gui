@@ -10,6 +10,7 @@ import type {
   DownloadResult,
   DownloadStartedEvent,
   EnqueueResult,
+  PlaylistEnqueueResult,
 } from "./types";
 
 export const DOWNLOAD_STARTED_EVENT = "download-started";
@@ -181,6 +182,22 @@ export async function enqueueDownload(
     throw new Error("Please paste a video URL first.");
   }
   return invoke<EnqueueResult>("enqueue_download", {
+    request: { ...request, url },
+  });
+}
+
+/**
+ * Enqueue a playlist request snapshot. Returns all accepted child items in
+ * playlist order, plus a count of skipped unavailable entries.
+ */
+export async function enqueuePlaylist(
+  request: DownloadRequest,
+): Promise<PlaylistEnqueueResult> {
+  const url = request.url.trim();
+  if (url.length === 0) {
+    throw new Error("Please paste a playlist URL first.");
+  }
+  return invoke<PlaylistEnqueueResult>("enqueue_playlist", {
     request: { ...request, url },
   });
 }

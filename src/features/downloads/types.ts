@@ -81,3 +81,16 @@ export type CancelJobOutcome = "cancelling" | "removed" | "notFound";
 export interface EnqueueResult {
   jobId: number;
 }
+
+export type DownloadScope = "single" | "playlist";
+
+export interface PlaylistEnqueueItem {
+  jobId: number;
+  url: string;
+  title?: string | null;
+}
+
+export interface PlaylistEnqueueResult {
+  items: PlaylistEnqueueItem[];
+  skippedCount: number;
+}

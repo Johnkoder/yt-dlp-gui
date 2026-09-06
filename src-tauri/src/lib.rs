@@ -17,6 +17,7 @@ pub fn build_app() -> tauri::Builder<tauri::Wry> {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::download::enqueue_download,
+            commands::download::enqueue_playlist,
             commands::download::cancel_job,
             commands::download::get_downloads_dir,
             commands::download::validate_output_directory,

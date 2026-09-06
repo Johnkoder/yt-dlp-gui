@@ -417,6 +417,28 @@ fn escape_template_literal(value: &str) -> String {
     value.replace('%', "%%")
 }
 
+/// Validate an http(s) URL shape. Shared by download commands and playlist
+/// discovery; yt-dlp itself does the real validation later.
+pub(crate) fn is_valid_http_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://")) && url.len() <= 2048
+}
+
+/// Build a yt-dlp child process with the shared environment: if Deno lives
+/// only at the user fallback (~/.deno/bin), that directory is prepended to
+/// the CHILD's PATH only, so every yt-dlp invocation — downloads and
+/// playlist discovery alike — can actually use the detected Deno. The
+/// system environment is never modified.
+pub(crate) fn yt_dlp_command(binary: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(binary);
+    if let Some(deno_dir) = deno_child_path_dir() {
+        if let Ok(child_path) = prepend_to_path_list(std::env::var_os("PATH"), &deno_dir) {
+            command.env("PATH", child_path);
+        }
+    }
+    command
+}
+
 /// Build the yt-dlp argument list in one place.
 ///
 /// The binary is executed directly with individual arguments (never via
@@ -806,15 +828,7 @@ pub async fn run_download(
         return;
     }
 
-    let mut command = tokio::process::Command::new(&binary);
-    // If Deno lives only at the user fallback (~/.deno/bin), the child
-    // would otherwise never see it: prepend that directory to the CHILD's
-    // PATH only. The system environment is never modified.
-    if let Some(deno_dir) = deno_child_path_dir() {
-        if let Ok(child_path) = prepend_to_path_list(std::env::var_os("PATH"), &deno_dir) {
-            command.env("PATH", child_path);
-        }
-    }
+    let mut command = yt_dlp_command(&binary);
     let mut child = match command
         .args(&args)
         .stdout(std::process::Stdio::piped())
@@ -1008,8 +1022,8 @@ pub async fn run_download(
 ///
 /// Operates on Unicode scalar values, never on byte offsets, so titles or
 /// errors containing emoji/CJK/accents can never cause a panic at a
-/// non-character boundary.
-fn tail_text(text: &str, max_chars: usize) -> String {
+/// non-character boundary. Shared with playlist discovery diagnostics.
+pub(crate) fn tail_text(text: &str, max_chars: usize) -> String {
     let trimmed = text.trim();
     let len = trimmed.chars().count();
     if len <= max_chars {

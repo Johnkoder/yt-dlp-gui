@@ -6,6 +6,7 @@ import { MediaTypeSelector } from "./components/MediaTypeSelector";
 import { OutputFolderSelector } from "./components/OutputFolderSelector";
 import { QualitySelector } from "./components/QualitySelector";
 import { QueueSection } from "./components/QueueSection";
+import { ScopeSelector } from "./components/ScopeSelector";
 import { UrlInput } from "./components/UrlInput";
 import { AUDIO_FORMAT_LABELS } from "./features/downloads/options";
 import { useDependencies } from "./features/dependencies/hooks/useDependencies";
@@ -17,6 +18,8 @@ export default function App() {
     initStatus,
     url,
     setUrl,
+    scope,
+    setScope,
     mediaType,
     setMediaType,
     quality,
@@ -28,6 +31,7 @@ export default function App() {
     jobs,
     isSubmitting,
     enqueueError,
+    enqueueNotice,
     initErrorMessage,
     initErrorDetails,
     canEnqueue,
@@ -74,11 +78,17 @@ export default function App() {
   // While downloading the button falls back to its internal "Downloading…".
   const actionLabel = isInitializing
     ? "Loading…"
-    : hasPendingJobs
-      ? "Add to Queue"
-      : isAudio
-        ? "Download Audio"
-        : "Download Video";
+    : isSubmitting
+      ? scope === "playlist"
+        ? "Adding Playlist…"
+        : "Downloading…"
+      : scope === "playlist"
+        ? "Add Playlist to Queue"
+        : hasPendingJobs
+          ? "Add to Queue"
+          : isAudio
+            ? "Download Audio"
+            : "Download Video";
 
   return (
     <div className="app">
@@ -107,6 +117,12 @@ export default function App() {
             }
           }}
           disabled={isInitializing || initFailed}
+        />
+
+        <ScopeSelector
+          value={scope}
+          onChange={setScope}
+          disabled={isInitializing || initFailed || isSubmitting}
         />
 
         <MediaTypeSelector
@@ -174,6 +190,12 @@ export default function App() {
         {enqueueError && (
           <p className="hint hint--error" role="alert">
             {enqueueError}
+          </p>
+        )}
+
+        {enqueueNotice && (
+          <p className="hint hint--info" role="status">
+            {enqueueNotice}
           </p>
         )}
 

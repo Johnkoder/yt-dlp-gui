@@ -85,6 +85,20 @@ function defaultAnswer(command: string, args?: unknown) {
     const jobId = backend.enqueueIds.shift() ?? 99;
     return Promise.resolve({ jobId });
   }
+  if (command === "enqueue_playlist") {
+    if (backend.failEnqueueWith) {
+      return Promise.reject(new Error(backend.failEnqueueWith));
+    }
+    const id1 = backend.enqueueIds.shift() ?? 91;
+    const id2 = backend.enqueueIds.shift() ?? 92;
+    return Promise.resolve({
+      items: [
+        { jobId: id1, url: "https://example.com/item1", title: "Item 1" },
+        { jobId: id2, url: "https://example.com/item2", title: "Item 2" },
+      ],
+      skippedCount: 1,
+    });
+  }
   if (command === "cancel_job") {
     return Promise.resolve(backend.cancelOutcome);
   }
@@ -754,5 +768,48 @@ describe("App dependencies", () => {
         outputDirectory: DEFAULT_DIR,
       },
     });
+  });
+
+  it("updates button text and calls enqueue_playlist in Playlist mode", async () => {
+    await renderReadyApp();
+
+    expect(screen.getByRole("radio", { name: "Single item" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: "Playlist" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+
+    fireEvent.click(screen.getByRole("radio", { name: "Playlist" }));
+    expect(screen.getByRole("radio", { name: "Playlist" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    enterUrl("https://example.com/playlist?list=PL123");
+    const button = screen.getByRole("button", {
+      name: /add playlist to queue/i,
+    });
+    expect(button).toBeEnabled();
+
+    fireEvent.click(button);
+    await act(async () => {});
+
+    expect(mockInvoke).toHaveBeenCalledWith("enqueue_playlist", {
+      request: {
+        url: "https://example.com/playlist?list=PL123",
+        mediaType: "video",
+        quality: "best",
+        audioFormat: null,
+        outputDirectory: DEFAULT_DIR,
+      },
+    });
+
+    // Should display notice with enqueued and skipped count
+    expect(
+      screen.getByText(/Added 2 items\. 1 unavailable entry was skipped\./i),
+    ).toBeInTheDocument();
   });
 });

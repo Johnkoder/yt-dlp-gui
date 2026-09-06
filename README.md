@@ -38,6 +38,12 @@ tool yt-dlp uses for merging separate streams and future conversion.
   one active yt-dlp job at a time, waiting jobs removable, automatic
   continuation after success/error/cancellation. Session-only, not
   persisted
+- Download scope: **Single item** (default) or **Playlist**. In Single item
+  mode, `--no-playlist` prevents unintended bulk downloads even if the URL
+  includes a `?list=...` parameter. In Playlist mode, playlist items are
+  flat-discovered without downloading media, and expanded into individual
+  FIFO queue jobs preserving playlist sequence, downloading one item at a
+  time. Skipped/unavailable entries are reported in a summary status notice
 - Active downloads can be cancelled: the yt-dlp job (including any
   FFmpeg child on Windows) is terminated and cancellation is reported
   as its own neutral state, not an error. Cancelling may leave a
@@ -101,7 +107,7 @@ yt-dlp.exe  (direct execution, one argv element per argument)
 ```text
 yt-dlp-gui/
 ├── src/
-│   ├── components/            # UrlInput, DownloadButton,
+│   ├── components/            # UrlInput, ScopeSelector, DownloadButton,
 │   │                          # DownloadProgress, CancelButton,
 │   │                          # MediaTypeSelector, QualitySelector,
 │   │                          # AudioFormatSelector, QueueSection,
@@ -111,7 +117,7 @@ yt-dlp-gui/
 │   │   ├── downloadService.ts     # Tauri invoke/listen/dialog wrapper + errors
 │   │   ├── options.ts             # MediaType, VideoQuality, DownloadRequest
 │   │   ├── outputDirectory.ts     # output-folder preference persistence
-│   │   └── types.ts               # JobStatus, DownloadJob, job events
+│   │   └── types.ts               # JobStatus, DownloadJob, job events, scope
 │   ├── features/dependencies/
 │   │   ├── hooks/useDependencies.ts  # idle|loading|ready|error checks
 │   │   ├── dependencyService.ts      # check_dependencies wrapper
@@ -122,12 +128,13 @@ yt-dlp-gui/
 ├── src-tauri/
 │   ├── src/
 │   │   ├── commands/
-│   │   │   ├── download.rs        # enqueue/cancel_job, FIFO worker, dirs,
-│   │   │   │                      # open_output_folder
+│   │   │   ├── download.rs        # enqueue/enqueue_playlist/cancel_job, FIFO worker,
+│   │   │   │                      # dirs, open_output_folder
 │   │   │   └── dependencies.rs    # check_dependencies
 │   │   ├── services/
 │   │   │   ├── ytdlp.rs           # binary resolver, argv builder,
 │   │   │   │                      # progress parser, process runner
+│   │   │   ├── playlist.rs        # flat metadata discovery, JSON parsing
 │   │   │   └── dependencies.rs    # yt-dlp/Deno/FFmpeg detection
 │   │   ├── lib.rs                 # composition root
 │   │   └── main.rs
@@ -215,14 +222,9 @@ cargo test             # needs MSVC link.exe on Windows
 
 ## Current limitations
 
-- One download at a time (MVP guard; the state type is shaped to become
-  a queue later).
-- Always downloads to the Windows Downloads folder, always a single
-  video (`--no-playlist`), yt-dlp's default format selection (separate
-  streams are merged when FFmpeg is available; the reported filename is
-  always the real post-merge file).
-- No quality picker, audio-only/MP3 mode, subtitle, playlist, history,
-  cancellation, settings, or updater UI yet.
+- One active download at a time (FIFO queue sequential execution).
+- Whole-window scrolling; queue entries are session-only and cleared upon reload.
+- No subtitles, history, settings, or updater UI yet.
 - Full linking and `cargo test` of the Tauri crate require MSVC; with
   only a GNU toolchain, `cargo check`/`clippy` still validate the code.
 - The placeholder `icon.icns` is bundle filler for non-Windows targets;
@@ -239,10 +241,12 @@ Completed:
 - cancellation (terminates the yt-dlp job tree, neutral Cancelled state)
 - sequential download queue (FIFO, one active job, remove/cancel,
   auto-continue, session-only)
+- playlist support (explicit Single item / Playlist scope selector, flat
+  discovery, queue expansion preserving order, skipped item accounting)
 
 Possible next:
-- playlist support
 - history
+- subtitles selection
 - dependency setup assistance
 etc.
 
