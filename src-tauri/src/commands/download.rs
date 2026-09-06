@@ -614,7 +614,9 @@ mod tests {
             .collect();
         let (ids, spawn) = control.enqueue_batch(batch);
         assert_eq!(ids.len(), 3);
-        assert!(spawn, "idle worker must be requested once");
+        // X and Y already marked a worker running, so the batch must NOT
+        // request another one — order and IDs are what this test pins.
+        assert!(!spawn, "no second worker while running");
         assert_eq!(
             control.queued_ids(),
             vec![x, y, ids[0], ids[1], ids[2]],

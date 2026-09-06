@@ -6,8 +6,11 @@ Paste a URL, press **Download**, watch real progress, and find the
 file in your Downloads folder. Multiple downloads queue up and run one
 at a time.
 
-**yt-dlp** does the actual downloading — this app is a native GUI around
-the `yt-dlp.exe` binary, which is bundled as an application resource.
+**yt-dlp** does the actual downloading — this app is an independent
+graphical frontend for [yt-dlp](https://github.com/yt-dlp/yt-dlp) (it is
+not affiliated with or endorsed by the yt-dlp project). At build setup
+time, the official `yt-dlp.exe` release binary is fetched, hash-verified,
+and bundled into packaged builds as an application resource.
 
 Roles: **yt-dlp** is required and bundled; **Deno** is an external JS
 runtime yt-dlp uses for modern site extraction; **FFmpeg** is an external
@@ -149,12 +152,17 @@ yt-dlp-gui/
 │   │   │   └── dependencies.rs    # yt-dlp/Deno/FFmpeg detection
 │   │   ├── lib.rs                 # composition root
 │   │   └── main.rs
-│   ├── resources/bin/yt-dlp.exe   # bundled downloader binary
+│   ├── resources/bin/         # yt-dlp.exe lives here after setup
+│   │                          # (fetched, never committed)
 │   ├── capabilities/default.json
 │   ├── icons/
 │   ├── Cargo.toml
 │   └── tauri.conf.json
-├── scripts/verify-ytdlp.ps1   # checks the bundled binary runs
+├── scripts/
+│   ├── fetch-ytdlp.ps1        # downloads the pinned official yt-dlp.exe
+│   ├── verify-ytdlp.ps1       # verifies hash/version of the local binary
+│   ├── ytdlp-version.json     # pinned yt-dlp version + SHA-256
+│   └── check-env.mjs          # prints dev-environment status
 ├── package.json
 ├── vite.config.ts
 └── tsconfig.json
@@ -195,10 +203,18 @@ cd yt-dlp-gui
 npm install
 ```
 
-The `yt-dlp.exe` binary ships in `src-tauri/resources/bin/`. Verify it:
+Fetch the pinned official yt-dlp executable (verified by SHA-256) into
+`src-tauri/resources/bin/`:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\verify-ytdlp.ps1
+npm run setup:ytdlp
+```
+
+Verify it at any time (read-only — downloads, installs, and modifies
+nothing):
+
+```powershell
+npm run verify:ytdlp
 ```
 
 ## How to start development
@@ -216,17 +232,20 @@ with live reload.
 npm run tauri build
 ```
 
-Produces a Windows installer/bundle. The `yt-dlp.exe` resource is
-included via the `bundle.resources` entry in `tauri.conf.json`.
+Produces a Windows installer/bundle. The verified `yt-dlp.exe` resource
+is included via the `bundle.resources` entry in `tauri.conf.json`. The
+application itself never downloads anything at runtime; fetching yt-dlp
+is a developer build-setup step only.
 
 ## Checks
 
 ```powershell
 npm run build          # tsc --noEmit + vite production build
-npm test               # vitest: event-readiness state machine tests
+npm run lint           # tsc --noEmit
+npm test               # vitest suite
 cd src-tauri
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo check
 cargo test             # needs MSVC link.exe on Windows
 ```
@@ -264,5 +283,15 @@ etc.
 
 ## License
 
-MIT. yt-dlp itself is public-domain software by its authors; see
-https://github.com/yt-dlp/yt-dlp.
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
+
+Third-party components such as yt-dlp are distributed under their own
+licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This
+project does not grant rights to yt-dlp itself.
+
+## Disclaimer
+
+This project is a graphical frontend for yt-dlp. Users are responsible
+for complying with applicable laws, copyright rules, website terms of
+service, and content licenses. This project does not grant any right to
+download, copy, or redistribute content.

@@ -7,9 +7,9 @@ src-tauri/gen/
 # Tauri bundles
 src-tauri/*.log
 
-# yt-dlp binary is intentionally committed as an app resource.
-# Uncomment the line below only if you prefer to fetch it at build time.
-# src-tauri/resources/bin/yt-dlp.exe
+# yt-dlp binary is fetched at build setup time, not committed.
+# See scripts/ytdlp-version.json + `npm run setup:ytdlp`.
+src-tauri/resources/bin/yt-dlp.exe
 
 # Editor / OS
 .vscode/*
@@ -20,3 +20,4 @@ Thumbs.db
 *.log
 .env
 .env.local
+.env.*.local

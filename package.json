@@ -13,7 +13,9 @@
     "tauri": "tauri",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "check-env": "node scripts/check-env.mjs"
+    "check-env": "node scripts/check-env.mjs",
+    "setup:ytdlp": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/fetch-ytdlp.ps1",
+    "verify:ytdlp": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/verify-ytdlp.ps1"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

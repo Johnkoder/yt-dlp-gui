@@ -289,7 +289,10 @@ mod tests {
 
     #[test]
     fn empty_or_useless_playlists_error() {
-        // D: no valid entries anywhere is a friendly error, never a job.
+        // D: empty entry lists are friendly errors, never jobs. An entries
+        // array whose items are all unusable parses to an empty list (the
+        // enqueue command rejects that); only truly unparseable input
+        // errors here.
         let mut fixture = playlist_fixture();
         fixture["entries"] = serde_json::json!([]);
         assert!(parse_playlist_json(&serde_json::to_string(&fixture).expect("json")).is_err());
@@ -298,7 +301,14 @@ mod tests {
             "_type": "playlist",
             "entries": [{"_type": "url", "url": None::<String>}]
         });
-        assert!(parse_playlist_json(&serde_json::to_string(&bad).expect("json")).is_err());
+        // All-skipped parses to an empty list (skips are never fatal here);
+        // the enqueue command turns that into the friendly "no downloadable
+        // items" error instead of queueing anything.
+        let discovery =
+            parse_playlist_json(&serde_json::to_string(&bad).expect("json"))
+                .expect("parses");
+        assert!(discovery.entries.is_empty());
+        assert_eq!(discovery.skipped, 1);
 
         // Failure stdout ("null") and garbage are errors, not jobs.
         assert!(parse_playlist_json("null").is_err());
